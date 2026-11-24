@@ -1,5 +1,9 @@
-release/
+# kept on this PC, never uploaded: the upload tools, the private word list and the release build
+upload.bat
+upload.ps1
 upload_private_words.txt
+release_readme.txt
+release/
 *.iso
 game/
 user/
