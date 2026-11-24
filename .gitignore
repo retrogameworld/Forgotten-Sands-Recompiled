@@ -1,0 +1,6 @@
+release/
+upload_private_words.txt
+*.iso
+game/
+user/
+*.log

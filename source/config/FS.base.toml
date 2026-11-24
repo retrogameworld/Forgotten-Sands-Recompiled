@@ -1,0 +1,40 @@
+# XenonRecomp config for Prince of Persia: The Forgotten Sands (X360, title 5553083E).
+# This is the hand-written part. run_recomp.ps1 appends the generated `functions` list and writes FS.toml.
+# Paths are relative to this folder (absolute paths crash XenonRecomp). game\ is the tester's dump: never share it.
+[main]
+file_path = "../../game/default.xex"
+out_directory_path = "../../builds/ppc"
+switch_table_file_path = "../analysis/switch_tables.toml"
+
+skip_lr = true
+skip_msr = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+# Step 35: tier 2 (register locals) was ON for a day; the tester hit a crash breaking an urn (read of host -1 in sub_82BED9E8),
+# so it is OFF again until verified. Was: (120 fps, like the Superman recomp's tier 2): registers as C++ locals, but only in functions the
+# safe_locals analysis (Torchlight Step 11) proves safe; the others keep every register in ctx
+# (list: builds\ppc\safe_locals_ctx_only.txt). Old setting: both false, safe_locals off.
+non_argument_as_local = false
+non_volatile_as_local = false
+safe_locals = false
+# _local_unwind (calls RtlUnwind with r5 = r6 = 0) and the __C_specific_handler import thunk that MSVC puts at
+# fn-8 in front of functions with a __try scope table (64 of them). Found with scratch findseh.py.
+local_unwind_address = 0x829B1250
+seh_handler_thunk_address = 0x82DE4DE4
+
+# Found with: builds\analysis\xexdiag.exe game\default.xex helpers
+restgprlr_14_address = 0x8299F820
+savegprlr_14_address = 0x8299F7D0
+restfpr_14_address = 0x829A73BC
+savefpr_14_address = 0x829A7370
+restvmx_14_address = 0x82D71718
+savevmx_14_address = 0x82D71480
+restvmx_64_address = 0x82D717AC
+savevmx_64_address = 0x82D71514
+
+# longjmp calls RtlUnwind (import thunk 0x82DE51C4) and restores f14-f31/r13-r31/v from the jmp_buf.
+# setjmp stores the same registers into the jmp_buf. Emitted as PPC_SETJMP/PPC_LONGJMP (runtime).
+longjmp_address = 0x82D70D70
+setjmp_address = 0x82D711B0
