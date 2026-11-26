@@ -1,9 +1,9 @@
 # Forgotten Sands Recompiled
 
-An unofficial native Windows PC port of **Prince of Persia: The Forgotten Sands** (Xbox 360), made by static
-recompilation. The game's Xbox 360 program was translated into native x86-64 code, and the console's graphics,
-sound, file and system calls were rebuilt for Windows with Vulkan and SDL. It is not an emulator: the game runs as a
-normal PC program.
+An unofficial native port of **Prince of Persia: The Forgotten Sands** (Xbox 360) for **Windows PC** and **Android**,
+made by static recompilation. The game's Xbox 360 program was translated into native x86-64 and ARM64 code, and the
+console's graphics, sound, file and system calls were rebuilt with Vulkan and SDL. It is not an emulator: the game
+runs as a normal program.
 
 **No game files are included.** You need your own Xbox 360 disc of the game, dumped to a disc image (.iso).
 
@@ -47,6 +47,26 @@ supported.
 If you already have the game unpacked (the disc's files, with `default.xex` in them), you can copy those files into a
 `game` folder next to the exe instead of using a disc image.
 
+## Android
+
+The Android version is the same port built for 64-bit ARM. It was made and tested on the AYN Odin 3 (Snapdragon 8
+Elite), where it runs at 1080p and mostly 60 fps (50-60 in the busiest fights).
+
+**Requirements:** Android 11 or newer, 64-bit ARM, Vulkan 1.1 (a recent Snapdragon is recommended), about 6 GB of free
+space, and a controller (a handheld's own controls or a paired controller; there are no touch controls).
+
+1. Download `ForgottenSandsRecompiled-Android-arm64.apk` from the [Releases](../../releases) page and install it
+   (allow installing from your browser or file manager when Android asks).
+2. Start **Forgotten Sands** and choose your disc image (`.iso`) with the file picker. It is unpacked once into the
+   app's own folder (`Android/data/com.fsrecomp.forgottensands/files/game`). You can also copy the `.iso` (or an
+   already unpacked `game` folder) into `Android/data/com.fsrecomp.forgottensands/files` from a PC first.
+3. The start screen has **Play**, **Settings** and **Quit**. Settings: resolution (screen size, 1600x900 or
+   1280x720), frame rate (60, 30, 120 or no limit), smooth edges and vibration. They are kept in `settings.toml` in the
+   app's folder.
+
+After unpacking, the `.iso` can be deleted. Saves are kept in the app's `user` folder; uninstalling the app removes
+them together with the unpacked game.
+
 ### Making a disc image
 
 Dump the disc with an Xbox 360 that can read discs to a USB drive or network (for example with a dashboard file
@@ -73,7 +93,7 @@ Delete `settings.toml` to get the default settings back.
 ## How it works
 
 - **CPU:** the game's PowerPC program (`default.xex`) was translated function by function into C++ with
-  [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) and compiled for x86-64. The program you download contains
+  [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) and compiled for x86-64 (PC) and ARM64 (Android). The program you download contains
   that translated code; it only runs together with the game executable from your own disc, which is loaded at start
   for its data and checked against the version the code was made from.
 - **Graphics:** the game's Direct3D 9-style calls are rebuilt on Vulkan (based on the runtime of

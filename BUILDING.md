@@ -27,7 +27,17 @@ The CMake files expect this layout (the names under `tools` matter):
   builds\
 ```
 
-Clone the three hedge-dev repositories with `--recursive` (they use submodules). FFmpeg: for example the
+Clone the three hedge-dev repositories with `--recursive` (they use submodules), check out the commits listed in
+`source/patches/versions.txt` and apply this project's changes to them:
+
+```
+git -C tools\XenonRecomp apply <repository>\source\patches\XenonRecomp.diff
+git -C tools\XenosRecomp apply <repository>\source\patches\XenosRecomp.diff
+git -C tools\UnleashedRecomp\thirdparty\plume apply <repository>\source\patches\plume.diff
+git -C tools\UnleashedRecomp\thirdparty\SDL apply <repository>\source\patches\SDL.diff
+```
+
+ FFmpeg: for example the
 `ffmpeg-n8.1-latest-win64-lgpl-shared` build from https://github.com/BtbN/FFmpeg-Builds.
 
 ## Steps
@@ -66,3 +76,25 @@ From a "x64 Native Tools Command Prompt for VS 2022", in `<project folder>`:
 `--input-script <file>` (scripted controller input, see `source/runtime/hid/input_script.cpp`), `--any-xex` (skip the
 game version check). Many diagnostic switches are environment variables named `FS_*`; they are described in the
 comments where the code reads them.
+
+## Android
+
+The Android app is built on Windows with the Android SDK tools, without Gradle. The scripts are in `source/android`
+(copy it to `<project folder>\android`); the paths at the top of each script name the tool folders and the project
+folder, change them to yours.
+
+Tools: Android NDK 29.0.14206865, Android SDK build-tools 35 and platform android-35, CMake 3.31 (from the SDK),
+JDK 17, Git for Windows (Git Bash) and LLVM for Windows (FFmpeg's helper tools). Sources: DirectXShaderCompiler
+v1.8.2505.1 in `tools\dxc-src` and FFmpeg 8.1.3 in `tools\ffmpeg-src`.
+
+1. Translate the game's code (step 2 above): the same `builds\ppc` files are used.
+2. `android\build_ppc.bat` builds the translated code for ARM64 (`builds\android_ppc`).
+3. `android\build_dxc.bat` builds DirectXShaderCompiler for Android (`builds\android_dxc`).
+4. `android\build_ffmpeg.bat` builds a small static FFmpeg for Android (`builds\android_ffmpeg`).
+5. `android\build_runtime.bat` builds the game program as `libmain.so` (`builds\android_runtime`).
+6. In Git Bash: `sh android/build_apk.sh` packs and signs `builds/android_apk/ForgottenSands.apk`. The first run makes
+   a signing key `android\fsrecomp.keystore` for you (keep it: updates must be signed with the same key).
+   `DEBUGGABLE=1` makes a debuggable build for profiling.
+
+For development, `files/env.txt` in the app's folder can hold `KEY=VALUE` lines that the game reads as environment
+variables (the `FS_*` switches above).
