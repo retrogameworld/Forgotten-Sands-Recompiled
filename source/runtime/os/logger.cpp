@@ -3,6 +3,7 @@
 
 #ifdef __ANDROID__
 #include <android/log.h>
+#include <unistd.h>
 #endif
 
 static std::mutex g_logMutex;
@@ -69,4 +70,44 @@ void os::logger::Flush()
     fflush(stdout);
     if (g_logFile)
         fflush(g_logFile);
+}
+
+// Step 38 (Android): an app's stderr goes nowhere, and plume (the Vulkan layer) reports every failure there - why a
+// device could not be made, why a pipeline failed. A pipe in place of stderr feeds those lines into the log.
+void os::logger::CaptureStderr()
+{
+#ifdef __ANDROID__
+    static bool s_done = false;
+    if (s_done)
+        return;
+    s_done = true;
+    int fds[2];
+    if (pipe(fds) != 0)
+        return;
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    if (dup2(fds[1], 2) < 0)
+    {
+        close(fds[0]);
+        close(fds[1]);
+        return;
+    }
+    close(fds[1]);
+    std::thread([fd = fds[0]] {
+        std::string pending;
+        char buf[1024];
+        for (;;)
+        {
+            const ssize_t n = read(fd, buf, sizeof(buf));
+            if (n <= 0)
+                break;
+            pending.append(buf, size_t(n));
+            for (size_t at; (at = pending.find('\n')) != std::string::npos;)
+            {
+                if (at > 0)
+                    Log(std::string_view(pending.data(), at), ELogType::None, "stderr");
+                pending.erase(0, at + 1);
+            }
+        }
+    }).detach();
+#endif
 }

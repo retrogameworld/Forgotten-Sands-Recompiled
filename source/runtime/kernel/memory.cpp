@@ -35,6 +35,37 @@ static uint8_t* MapAliasedGuestMemory(uint8_t* want)
     }
     return want; // the section handle stays open for the life of the process
 }
+#else
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+// Step 37 (Android / Linux): the same aliasing with a shared memory file mapped at both addresses.
+static uint8_t* MapAliasedGuestMemory()
+{
+    constexpr uint64_t PHYS_SIZE = 0x20000000;
+    auto* base = (uint8_t*)mmap((void*)0x100000000ull, PPC_MEMORY_SIZE, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
+    if (base == (uint8_t*)MAP_FAILED)
+        return nullptr;
+    const int fd = int(syscall(__NR_memfd_create, "fs_guest_physical", 0));
+    if (fd < 0 || ftruncate(fd, off_t(PHYS_SIZE)) != 0)
+    {
+        if (fd >= 0) close(fd);
+        munmap(base, PPC_MEMORY_SIZE);
+        return nullptr;
+    }
+    const bool ok =
+        mmap(base, 0xA0000000ull, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED | MAP_NORESERVE, -1, 0) == base &&
+        mmap(base + 0xA0000000ull, PHYS_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == base + 0xA0000000ull &&
+        mmap(base + 0xC0000000ull, PHYS_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == base + 0xC0000000ull &&
+        mmap(base + 0xE0000000ull, PPC_MEMORY_SIZE - 0xE0000000ull, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED | MAP_NORESERVE, -1, 0) == base + 0xE0000000ull;
+    close(fd); // the mappings keep the memory
+    if (!ok)
+    {
+        munmap(base, PPC_MEMORY_SIZE);
+        return nullptr;
+    }
+    return base;
+}
 #endif
 Memory::Memory()
 {
@@ -52,11 +83,15 @@ Memory::Memory()
     DWORD oldProtect;
     VirtualProtect(base, 4096, PAGE_NOACCESS, &oldProtect);
 #else
-    base = (uint8_t*)mmap((void*)0x100000000ull, PPC_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    base = MapAliasedGuestMemory();
+    if (base == nullptr)
+        base = (uint8_t*)mmap((void*)0x100000000ull, PPC_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
 
     if (base == (uint8_t*)MAP_FAILED)
-        base = (uint8_t*)mmap(NULL, PPC_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        base = (uint8_t*)mmap(NULL, PPC_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
 
+    if (base == (uint8_t*)MAP_FAILED)
+        base = nullptr;
     if (base == nullptr)
         return;
 

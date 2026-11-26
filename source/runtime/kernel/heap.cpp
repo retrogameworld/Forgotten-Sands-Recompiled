@@ -21,10 +21,124 @@ static void TrackHeapEvent(const char* what, void* ptr, size_t size)
         LOGFN("[track] {} 0x{:08X} size 0x{:X} contains 0x{:08X} |{}", what, a, size, tracked, CurrentGuestCallChain(8));
     }
 }
+// ---- PhysicalArena (Step 38) ----
+static constexpr uint32_t PHYS_GRANULE = 16;
+
+void PhysicalArena::Init(uint32_t b, uint32_t e)
+{
+    begin = b; end = e;
+    freeByAddr.clear(); freeBySize.clear(); live.clear();
+    InsertFree(b, e - b);
+}
+
+void PhysicalArena::RemoveFree(std::map<uint32_t, uint32_t>::iterator it)
+{
+    freeBySize.erase({ it->second, it->first });
+    freeByAddr.erase(it);
+}
+
+void PhysicalArena::InsertFree(uint32_t start, uint32_t size)
+{
+    if (size == 0)
+        return;
+    // merge with the free neighbours
+    auto next = freeByAddr.lower_bound(start);
+    if (next != freeByAddr.end() && next->first == start + size)
+    {
+        size += next->second;
+        auto n = next++;
+        RemoveFree(n);
+    }
+    if (next != freeByAddr.begin())
+    {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second == start)
+        {
+            start = prev->first;
+            size += prev->second;
+            RemoveFree(prev);
+        }
+    }
+    freeByAddr.emplace(start, size);
+    freeBySize.insert({ size, start });
+}
+
+uint32_t PhysicalArena::Allocate(uint32_t size, uint32_t alignment)
+{
+    const uint32_t need = (std::max<uint32_t>(size, 1) + PHYS_GRANULE - 1) & ~(PHYS_GRANULE - 1);
+    alignment = std::max<uint32_t>(alignment, PHYS_GRANULE);
+    // Best fit: the smallest free block that holds the request at the asked alignment (lowest address on ties).
+    for (auto it = freeBySize.lower_bound({ need, 0 }); it != freeBySize.end(); ++it)
+    {
+        const uint32_t start = it->second, bsize = it->first;
+        const uint64_t a = (uint64_t(start) + alignment - 1) & ~uint64_t(alignment - 1);
+        if (a + need > uint64_t(start) + bsize)
+            continue;
+        RemoveFree(freeByAddr.find(start));
+        InsertFree(start, uint32_t(a - start));                                    // the part before the alignment
+        InsertFree(uint32_t(a + need), uint32_t(uint64_t(start) + bsize - (a + need))); // the rest
+        live[uint32_t(a)] = { uint32_t(a), need, size };
+        used += need;
+        requested += size;
+        peakUsed = std::max(peakUsed, used);
+        allocs++;
+        return uint32_t(a);
+    }
+    oomCount++;
+    return 0;
+}
+
+// 0xC0000000 is a second view of the same memory (kernel/memory.cpp)
+static uint32_t PhysCanon(uint32_t address) { return address >= 0xC0000000u && address < 0xE0000000u ? address - 0x20000000u : address; }
+
+bool PhysicalArena::Free(uint32_t address)
+{
+    auto it = live.find(PhysCanon(address));
+    if (it == live.end())
+        return false;
+    const Block b = it->second;
+    live.erase(it);
+    used -= b.size;
+    requested -= b.requested;
+    InsertFree(b.start, b.size);
+    return true;
+}
+
+uint32_t PhysicalArena::Size(uint32_t address) const
+{
+    auto it = live.find(PhysCanon(address));
+    return it == live.end() ? 0 : it->second.requested;
+}
+
+static bool UseO1HeapPhysical()
+{
+    static const bool s_on = getenv("FS_O1HEAP_PHYSICAL") != nullptr;
+    return s_on;
+}
+
 void Heap::Init()
 {
     heap = o1heapInit(g_memory.Translate(USER_HEAP_BEGIN), USER_HEAP_END - USER_HEAP_BEGIN);
-    physicalHeap = o1heapInit(g_memory.Translate(PHYSICAL_BEGIN), PHYSICAL_END - PHYSICAL_BEGIN);
+    if (UseO1HeapPhysical())
+        physicalHeap = o1heapInit(g_memory.Translate(PHYSICAL_BEGIN), PHYSICAL_END - PHYSICAL_BEGIN);
+    else
+        physicalArena.Init(PHYSICAL_BEGIN + 0x10000, PHYSICAL_END); // the first 64 KB stay unused (physical address 0)
+}
+
+// Step 38: how full the 512 MB physical memory is (every 10 s with an allocation, and on a failed one).
+void Heap::LogPhysicalStats(const char* why)
+{
+    std::lock_guard lock(physicalMutex);
+    if (physicalHeap)
+    {
+        const O1HeapDiagnostics d = o1heapGetDiagnostics(physicalHeap);
+        LOGFN("[mem] physical heap ({}, o1heap): in use {:.1f} MB incl. rounding, peak {:.1f} MB, of {:.1f} MB, failed {}",
+            why, d.allocated / 1048576.0, d.peak_allocated / 1048576.0, d.capacity / 1048576.0, d.oom_count);
+        return;
+    }
+    const auto& a = physicalArena;
+    LOGFN("[mem] physical heap ({}): in use {:.1f} MB ({} blocks), peak {:.1f} MB, of {:.1f} MB, largest free {:.1f} MB in {} free ranges, failed {}",
+        why, a.used / 1048576.0, a.live.size(), a.peakUsed / 1048576.0, (a.end - a.begin) / 1048576.0, a.LargestFree() / 1048576.0, a.freeByAddr.size(), a.oomCount);
 }
 
 void* Heap::Alloc(size_t size)
@@ -39,9 +153,37 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
     size = std::max<size_t>(1, size);
     alignment = alignment == 0 ? 0x1000 : std::max<size_t>(16, alignment);
 
-    std::lock_guard lock(physicalMutex);
+    if (physicalHeap == nullptr)
+    {
+        uint32_t address;
+        {
+            std::lock_guard lock(physicalMutex);
+            address = size < 0x20000000 ? physicalArena.Allocate(uint32_t(size), uint32_t(alignment)) : 0;
+        }
+        static std::atomic<int64_t> s_lastLog{0};
+        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t last = s_lastLog.load();
+        if (address == 0 || (now - last >= 10 && s_lastLog.compare_exchange_strong(last, now)))
+            LogPhysicalStats(address == 0 ? "allocation failed" : "10 s");
+        if (address == 0)
+            return nullptr;
+        void* ptr = g_memory.Translate(address);
+        TrackHeapEvent("alloc", ptr, size);
+        return ptr;
+    }
 
-    void* ptr = o1heapAllocate(physicalHeap, size + alignment);
+    void* ptr;
+    {
+        std::lock_guard lock(physicalMutex);
+        ptr = o1heapAllocate(physicalHeap, size + alignment);
+    }
+    {
+        static std::atomic<int64_t> s_lastLog{0};
+        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t last = s_lastLog.load();
+        if (ptr == nullptr || (now - last >= 10 && s_lastLog.compare_exchange_strong(last, now)))
+            LogPhysicalStats(ptr == nullptr ? "allocation failed" : "10 s");
+    }
     if (ptr == nullptr)
         return nullptr;
 
@@ -56,7 +198,7 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
 
 bool Heap::IsPhysical(const void* ptr) const
 {
-    return ptr >= (const void*)physicalHeap;
+    return ptr >= (const void*)g_memory.Translate(PHYSICAL_BEGIN);
 }
 
 void Heap::Free(void* ptr)
@@ -68,6 +210,16 @@ void Heap::Free(void* ptr)
     {
         TrackHeapEvent("free", ptr, Size(ptr));
         std::lock_guard lock(physicalMutex);
+        if (physicalHeap == nullptr)
+        {
+            if (!physicalArena.Free(g_memory.MapVirtual(ptr)))
+            {
+                static std::atomic<int> s_bad{0};
+                if (s_bad++ < 20)
+                    LOGFN_WARNING("[mem] physical free of 0x{:08X}: not an allocated block (ignored)", g_memory.MapVirtual(ptr));
+            }
+            return;
+        }
         o1heapFree(physicalHeap, *((void**)ptr - 1));
     }
     else
@@ -79,6 +231,11 @@ void Heap::Free(void* ptr)
 
 size_t Heap::Size(void* ptr)
 {
+    if (ptr && physicalHeap == nullptr && IsPhysical(ptr))
+    {
+        std::lock_guard lock(physicalMutex);
+        return physicalArena.Size(g_memory.MapVirtual(ptr));
+    }
     if (ptr)
         return *((size_t*)ptr - 2) - O1HEAP_ALIGNMENT; // relies on fragment header in o1heap.c
 

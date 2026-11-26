@@ -1,0 +1,2943 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..6abe996 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1,5 +1,6 @@
+ #include "pch.h"
+ #include "recompiler.h"
++#include <bitset>
+ #include <xex_patcher.h>
+ 
+ static uint64_t ComputeMask(uint32_t mstart, uint32_t mstop)
+@@ -214,6 +215,18 @@ void Recompiler::Analyse()
+                 {
+                     auto data = section.data + address - section.base;
+                     auto& fn = functions.emplace_back(Function::Analyze(data, section.base + section.size - address, address));
++
++                    // Torchlight: same overlap guard as in the linear sweep below.
++                    for (size_t a = address + 4; a < address + fn.size; a += 4)
++                    {
++                        auto known = image.symbols.find(a);
++                        if (known != image.symbols.end() && known->address == a && known->type == Symbol_Function)
++                        {
++                            fn.size = a - address;
++                            break;
++                        }
++                    }
++
+                     image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
+                 }
+             }
+@@ -243,6 +256,19 @@ void Recompiler::Analyse()
+             else
+             {
+                 auto& fn = functions.emplace_back(Function::Analyze(data, dataEnd - data, base));
++
++                // Torchlight: don't run over the start of a known function
++                // (e.g. one listed in the config), or it gets skipped.
++                for (size_t a = base + 4; a < base + fn.size; a += 4)
++                {
++                    auto known = image.symbols.find(a);
++                    if (known != image.symbols.end() && known->address == a && known->type == Symbol_Function)
++                    {
++                        fn.size = a - base;
++                        break;
++                    }
++                }
++
+                 image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
+ 
+                 base += fn.size;
+@@ -268,8 +294,8 @@ bool Recompiler::Recompile(
+     // TODO: we could cache these formats in an array
+     auto r = [&](size_t index)
+         {
+-            if ((config.nonArgumentRegistersAsLocalVariables && (index == 0 || index == 2 || index == 11 || index == 12)) || 
+-                (config.nonVolatileRegistersAsLocalVariables && index >= 14))
++            if ((fnNonArgLocals && (index == 0 || index == 2 || index == 11 || index == 12)) || 
++                (fnNonVolatileLocals && index >= 14))
+             {
+                 localVariables.r[index] = true;
+                 return fmt::format("r{}", index);
+@@ -279,8 +305,8 @@ bool Recompiler::Recompile(
+ 
+     auto f = [&](size_t index)
+         {
+-            if ((config.nonArgumentRegistersAsLocalVariables && index == 0) ||
+-                (config.nonVolatileRegistersAsLocalVariables && index >= 14))
++            if ((fnNonArgLocals && index == 0) ||
++                (fnNonVolatileLocals && index >= 14))
+             {
+                 localVariables.f[index] = true;
+                 return fmt::format("f{}", index);
+@@ -290,8 +316,8 @@ bool Recompiler::Recompile(
+ 
+     auto v = [&](size_t index)
+         {
+-            if ((config.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+-                (config.nonVolatileRegistersAsLocalVariables && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))))
++            if ((fnNonArgLocals && (index >= 32 && index <= 63)) ||
++                (fnNonVolatileLocals && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))))
+             {
+                 localVariables.v[index] = true;
+                 return fmt::format("v{}", index);
+@@ -373,12 +399,14 @@ bool Recompiler::Recompile(
+         {
+             if (address == config.longJmpAddress)
+             {
+-                println("\tlongjmp(*reinterpret_cast<jmp_buf*>(base + {}.u32), {}.s32);", r(3), r(4));
++                // Torchlight: PPC_LONGJMP/PPC_SETJMP (ppc_context.h) instead of the CRT ones; the
++                // Windows CRT longjmp unwinds host frames and crashed in the recompiled code.
++                println("\tPPC_LONGJMP(base + {}.u32, {}.s32);", r(3), r(4));
+             }
+             else if (address == config.setJmpAddress)
+             {
+                 println("\t{} = ctx;", env());
+-                println("\t{}.s64 = setjmp(*reinterpret_cast<jmp_buf*>(base + {}.u32));", temp(), r(3));
++                println("\t{}.s64 = PPC_SETJMP(base + {}.u32);", temp(), r(3));
+                 println("\tif ({}.s64 != 0) ctx = {};", temp(), env());
+                 println("\t{} = {};", r(3), temp());
+             }
+@@ -388,7 +416,7 @@ bool Recompiler::Recompile(
+ 
+                 if (targetSymbol != image.symbols.end() && targetSymbol->address == address && targetSymbol->type == Symbol_Function)
+                 {
+-                    if (config.nonVolatileRegistersAsLocalVariables && (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0))
++                    if (fnNonVolatileLocals && (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0))
+                     {
+                         // print nothing
+                     }
+@@ -420,6 +448,30 @@ bool Recompiler::Recompile(
+             }
+         };
+ 
++    // Torchlight: ctr branches (bdz, bdnz, ...) can leave the function too;
++    // treat those like printConditionalBranch does, as a tail call.
++    auto printCtrBranch = [&](const std::string& cond, size_t target)
++        {
++            if (target < fn.base || target >= fn.base + fn.size)
++            {
++                println("\tif ({}) {{", cond);
++                print("\t");
++                printFunctionCall(target);
++                println("\t\treturn;");
++                println("\t}}");
++            }
++            else
++            {
++                println("\tif ({}) goto loc_{:X};", cond, target);
++            }
++        };
++
++    auto crBitName = [](size_t bi)
++        {
++            static const char* names[] = { "lt", "gt", "eq", "so" };
++            return names[bi % 4];
++        };
++
+     auto printSetFlushMode = [&](bool enable)
+         {
+             auto newState = enable ? CSRState::VMX : CSRState::FPU;
+@@ -609,7 +661,9 @@ bool Recompiler::Recompile(
+     case PPC_INST_BCTR:
+         if (switchTable != config.switchTables.end())
+         {
+-            println("\tswitch ({}.u64) {{", r(switchTable->second.r));
++            // FS Step 35: the guest bounds-checks the index with a 32-bit compare (cmplwi); switching on all 64 bits
++            // sent an index with stray upper bits into __builtin_unreachable (the tester: crash breaking an urn).
++            println("\tswitch ({}.u32) {{", r(switchTable->second.r));
+ 
+             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
+             {
+@@ -649,7 +703,7 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_BDZ:
+         println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 == 0) goto loc_{:X};", ctr(), insn.operands[0]);
++        printCtrBranch(fmt::format("{}.u32 == 0", ctr()), insn.operands[0]);
+         break;
+ 
+     case PPC_INST_BDZLR:
+@@ -659,13 +713,13 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_BDNZ:
+         println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 != 0) goto loc_{:X};", ctr(), insn.operands[0]);
++        printCtrBranch(fmt::format("{}.u32 != 0", ctr()), insn.operands[0]);
+         break;
+ 
+     case PPC_INST_BDNZF:
+-        // NOTE: assuming eq here as a shortcut because all the instructions in the game do that
++        // Torchlight: use the real CR bit instead of assuming eq.
+         println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 != 0 && !{}.eq) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), insn.operands[1]);
++        printCtrBranch(fmt::format("{}.u32 != 0 && !{}.{}", ctr(), cr(insn.operands[0] / 4), crBitName(insn.operands[0])), insn.operands[1]);
+         break;
+ 
+     case PPC_INST_BEQ:
+@@ -827,29 +881,35 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_DIVD:
+-        println("\t{}.s64 = {}.s64 / {}.s64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        // Torchlight patch: x86 traps on /0 and INT_MIN/-1, PowerPC does not.
++        // (An earlier version of this patch lost the println and emitted nothing: FreeType's
++        // FT_DivFix/FT_MulDiv returned garbage and all text was 1 pixel tall.)
++        println("\t{}.s64 = ({}.s64 == 0 || ({}.s64 == INT64_MIN && {}.s64 == -1)) ? 0 : {}.s64 / {}.s64;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_DIVDU:
+-        println("\t{}.u64 = {}.u64 / {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = {}.u64 == 0 ? 0 : {}.u64 / {}.u64;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_DIVW:
+-        println("\t{}.s32 = {}.s32 / {}.s32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.s32 = ({}.s32 == 0 || ({}.s32 == INT32_MIN && {}.s32 == -1)) ? 0 : {}.s32 / {}.s32;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_DIVWU:
+-        println("\t{}.u32 = {}.u32 / {}.u32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u32 = {}.u32 == 0 ? 0 : {}.u32 / {}.u32;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_EIEIO:
+-        // no op
++        // FSRecomp Step 37: a real barrier on ARM (no-op on x86, see PPC_FENCE_* in ppc_context.h)
++        println("	PPC_FENCE_EIEIO();");
+         break;
+ 
+     case PPC_INST_EXTSB:
+@@ -1209,7 +1269,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LWSYNC:
+-        // no op
++        println("	PPC_FENCE_LWSYNC();"); // FSRecomp Step 37
+         break;
+ 
+     case PPC_INST_LWZ:
+@@ -1260,7 +1320,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_MFTB:
+-        println("\t{}.u64 = __rdtsc();", r(insn.operands[0]));
++        println("\t{{ extern uint64_t PPCQueryTimeBase(); {}.u64 = PPCQueryTimeBase(); }}", r(insn.operands[0])); // Torchlight: 49.875 MHz guest timebase scaled from a host clock (runtime)
+         break;
+ 
+     case PPC_INST_MR:
+@@ -1369,6 +1429,8 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_RLDICL:
+         println("\t{}.u64 = __builtin_rotateleft64({}.u64, {}) & 0x{:X};", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2], ComputeMask(insn.operands[3], 63));
++        if (strchr(insn.opcode->name, '.')) // Forgotten Sands: rldicl.
++            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_RLDICR:
+@@ -1711,7 +1773,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_SYNC:
+-        // no op
++        println("	PPC_FENCE_SYNC();"); // FSRecomp Step 37
+         break;
+ 
+     case PPC_INST_TDLGEI:
+@@ -1831,7 +1893,15 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VCMPBFP:
+     case PPC_INST_VCMPBFP128:
+-        println("\t__builtin_debugtrap();");
++        // Forgotten Sands: bounds compare. Per element: bit 31 = !(a <= b), bit 30 = !(a >= -b).
++        // Record form: CR6 eq = every element in bounds. (Upstream emitted a debug trap here.)
++        printSetFlushMode(true);
++        println("\t{{ uint32_t b_[4]; for (int i_ = 0; i_ < 4; i_++) {{ float a_ = {}.f32[i_], l_ = {}.f32[i_]; b_[i_] = (!(a_ <= l_) ? 0x80000000u : 0u) | (!(a_ >= -l_) ? 0x40000000u : 0u); }}", v(insn.operands[1]), v(insn.operands[2]));
++        println("\t  memcpy({}.u32, b_, 16);", v(insn.operands[0]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t  {}.lt = 0; {}.gt = 0; {}.eq = (b_[0] | b_[1] | b_[2] | b_[3]) == 0; {}.so = 0; }}", cr(6), cr(6), cr(6), cr(6));
++        else
++            println("\t}}");
+         break;
+ 
+     case PPC_INST_VCMPEQFP:
+@@ -2014,6 +2084,23 @@ bool Recompiler::Recompile(
+             println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]), insn.operands[4], temp());
+             break;
+ 
++        case 4: // Forgotten Sands: NORMSHORT4 - each lane is 3.0 + s * 2^-22; clamp, keep the low 16 bits.
++                // Placed like float16_4 below (u16[lane + 2 * shift]).
++            for (size_t i = 0; i < 4; i++)
++            {
++                println("\t{}.f32 = {}.f32[{}] != {}.f32[{}] ? 3.0f : fminf(fmaxf({}.f32[{}], 2.99218774f), 3.00781226f);", temp(), v(insn.operands[1]), i, v(insn.operands[1]), i, v(insn.operands[1]), i);
++                println("\t{}.u16[{}] = uint16_t({}.u32 & 0xFFFF);", v(insn.operands[0]), i + (2 * insn.operands[4]), temp());
++            }
++            break;
++
++        case 3: // Forgotten Sands: FLOAT16_2 - two halfs, placed like float16_4 (u16[lane + 2 * shift]).
++            for (size_t i = 0; i < 2; i++)
++            {
++                println("\t{{ float f_ = {}.f32[{}]; uint32_t b_; memcpy(&b_, &f_, 4); uint32_t s_ = (b_ >> 16) & 0x8000; int32_t e_ = int32_t((b_ >> 23) & 0xFF) - 112; uint32_t m_ = (b_ >> 13) & 0x3FF;", v(insn.operands[1]), i);
++                println("\t  {}.u16[{}] = uint16_t(f_ != f_ ? 0x7FFF : e_ <= 0 ? s_ : e_ > 31 ? (s_ | 0x7FFF) : (s_ | (uint32_t(e_) << 10) | m_)); }}", v(insn.operands[0]), i + (2 * insn.operands[4]));
++            }
++            break;
++
+         case 5: // float16_4
+             if (insn.operands[3] != 2 || insn.operands[4] > 2)
+                 fmt::println("Unexpected float16_4 pack instruction at {:X}", base);
+@@ -2088,6 +2175,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_VSEL:
++    case PPC_INST_VSEL128: // vsel128 vD,vA,vB,vD: the selector is operand 3 like vsel
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
+         break;
+ 
+@@ -2212,6 +2300,39 @@ bool Recompiler::Recompile(
+             println("\t{} = {};", v(insn.operands[0]), vTemp());
+             break;
+ 
++        case 4: // Forgotten Sands: 4 shorts (NORMSHORT4) -> (3 + x*2^-22, ...) like case 1, all four lanes
++            for (size_t i = 0; i < 4; i++)
++            {
++                println("\t{}.f32 = 3.0f;", temp());
++                println("\t{}.s32 += {}.s16[{}];", temp(), v(insn.operands[1]), 3 - i);
++                println("\t{}.f32[{}] = {}.f32;", vTemp(), 3 - i, temp());
++            }
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
++        // Torchlight patch: FLOAT16_2 (3) and FLOAT16_4 (5). Xbox 360 halfs have no INF/NaN
++        // (exponent 31 is a normal number), so convert by hand.
++        case 3: // 2 halfs -> (x, y, 0, 1)
++        case 5: // 4 halfs -> (x, y, z, w)
++        {
++            println("\t{{");
++            println("\t\tauto xhalf = [](uint16_t h) -> float {{ uint32_t s = uint32_t(h & 0x8000) << 16; int32_t e = (h >> 10) & 0x1F; uint32_t m = h & 0x3FF; uint32_t bits;"
++                " if (e == 0 && m == 0) bits = s; else {{ if (e == 0) {{ e = 1; while (!(m & 0x400)) {{ m <<= 1; e--; }} m &= 0x3FF; }} bits = s | (uint32_t(e + 112) << 23) | (m << 13); }}"
++                " float f; memcpy(&f, &bits, 4); return f; }};");
++            const bool four = (insn.operands[2] >> 2) == 5;
++            const size_t count = four ? 4 : 2;
++            for (size_t i = 0; i < count; i++)
++                println("\t\t{}.f32[{}] = xhalf({}.u16[{}]);", vTemp(), 3 - i, v(insn.operands[1]), count - 1 - i);
++            if (!four)
++            {
++                println("\t\t{}.f32[1] = 0.0f;", vTemp());
++                println("\t\t{}.f32[0] = 1.0f;", vTemp());
++            }
++            println("\t\t{} = {};", v(insn.operands[0]), vTemp());
++            println("\t}}");
++            break;
++        }
++
+         default:
+             println("\t__builtin_debugtrap();");
+             break;
+@@ -2263,6 +2384,224 @@ bool Recompiler::Recompile(
+         println("\t{}.u64 = {}.u64 ^ {};", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2] << 16);
+         break;
+ 
++    // ---- Torchlight additions: instructions this game uses that upstream lacks ----
++
++    case PPC_INST_BDZF:
++        println("\t--{}.u64;", ctr());
++        printCtrBranch(fmt::format("{}.u32 == 0 && !{}.{}", ctr(), cr(insn.operands[0] / 4), crBitName(insn.operands[0])), insn.operands[1]);
++        break;
++
++    case PPC_INST_BDNZT:
++        println("\t--{}.u64;", ctr());
++        printCtrBranch(fmt::format("{}.u32 != 0 && {}.{}", ctr(), cr(insn.operands[0] / 4), crBitName(insn.operands[0])), insn.operands[1]);
++        break;
++
++    case PPC_INST_LFSU:
++        printSetFlushMode(false);
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u32 = PPC_LOAD_U32({});", temp(), ea());
++        println("\t{}.f64 = double({}.f32);", f(insn.operands[0]), temp());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_LFSUX:
++        printSetFlushMode(false);
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u32 = PPC_LOAD_U32({});", temp(), ea());
++        println("\t{}.f64 = double({}.f32);", f(insn.operands[0]), temp());
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++
++    case PPC_INST_LFDU:
++        printSetFlushMode(false);
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = PPC_LOAD_U64({});", f(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_LFDUX:
++        printSetFlushMode(false);
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = PPC_LOAD_U64({});", f(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++
++    case PPC_INST_STFSU:
++        printSetFlushMode(false);
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        println("\tPPC_STORE_U32({}, {}.u32);", ea(), temp());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_STFSUX:
++        printSetFlushMode(false);
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        println("\tPPC_STORE_U32({}, {}.u32);", ea(), temp());
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++
++    case PPC_INST_STFDU:
++        printSetFlushMode(false);
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_U64({}, {}.u64);", ea(), f(insn.operands[0]));
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_LHZU:
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = PPC_LOAD_U16({});", r(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_LHAU:
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.s64 = int16_t(PPC_LOAD_U16({}));", r(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_STHU:
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_U16({}, {}.u16);", ea(), r(insn.operands[0]));
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_LBZUX:
++    case PPC_INST_LHZUX:
++    case PPC_INST_LWZUX:
++    case PPC_INST_LDUX:
++    {
++        const char* size = insn.opcode->id == PPC_INST_LBZUX ? "U8" : insn.opcode->id == PPC_INST_LHZUX ? "U16" : insn.opcode->id == PPC_INST_LWZUX ? "U32" : "U64";
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = PPC_LOAD_{}({});", r(insn.operands[0]), size, ea());
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++    }
++
++    case PPC_INST_STBUX:
++    case PPC_INST_STHUX:
++    case PPC_INST_STDUX:
++    {
++        const char* size = insn.opcode->id == PPC_INST_STBUX ? "U8" : insn.opcode->id == PPC_INST_STHUX ? "U16" : "U64";
++        const char* field = insn.opcode->id == PPC_INST_STBUX ? "u8" : insn.opcode->id == PPC_INST_STHUX ? "u16" : "u64";
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_{}({}, {}.{});", size, ea(), r(insn.operands[0]), field);
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++    }
++
++    case PPC_INST_LHBRX:
++        print("\t{}.u64 = __builtin_bswap16(PPC_LOAD_U16(", r(insn.operands[0]));
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32));", r(insn.operands[2]));
++        break;
++
++    case PPC_INST_EQV:
++        println("\t{}.u64 = ~({}.u64 ^ {}.u64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_ADDC:
++        println("\t{}.ca = {}.u32 + {}.u32 < {}.u32;", xer(), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]));
++        println("\t{}.u64 = {}.u64 + {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_ADDME:
++        // rD = rA + CA - 1; carry out unless rA == 0 and CA == 0
++        println("\t{}.u8 = ({}.u32 != 0) | {}.ca;", temp(), r(insn.operands[1]), xer());
++        println("\t{}.u64 = {}.u64 + {}.ca - 1;", r(insn.operands[0]), r(insn.operands[1]), xer());
++        println("\t{}.ca = {}.u8;", xer(), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_SUBFZE:
++        // rD = ~rA + CA; carry out only when rA == 0 and CA == 1
++        println("\t{}.u8 = ({}.u32 == 0) & {}.ca;", temp(), r(insn.operands[1]), xer());
++        println("\t{}.u64 = ~{}.u64 + {}.ca;", r(insn.operands[0]), r(insn.operands[1]), xer());
++        println("\t{}.ca = {}.u8;", xer(), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_LVEHX:
++        // Same as lvewx/lvx: loads the aligned 16 bytes holding the element.
++        print("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(base + ((", v(insn.operands[0]));
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32) & ~0xF))), simde_mm_load_si128((simde__m128i*)VectorMaskL)));", r(insn.operands[2]));
++        break;
++
++    case PPC_INST_VPKSWSS128:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_packs_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VSLO128:
++        // Shift left by octets. With the whole vector byte-reversed in host
++        // memory, a big-endian left shift moves bytes toward higher host indices.
++        println("\t{{ uint8_t sh_ = ({}.u8[0] >> 3) & 0xF; uint8_t t_[16]; for (int i_ = 0; i_ < 16; i_++) t_[i_] = i_ >= sh_ ? {}.u8[i_ - sh_] : 0; memcpy({}.u8, t_, 16); }}", v(insn.operands[2]), v(insn.operands[1]), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VCFPUXWS128:
++    case PPC_INST_VCTUXS: // same operation (Forgotten Sands)
++        println("\tfor (int i_ = 0; i_ < 4; i_++) {{ double x_ = double({}.f32[i_]) * {}.0; {}.u32[i_] = x_ != x_ || x_ <= 0.0 ? 0u : x_ >= 4294967295.0 ? 0xFFFFFFFFu : uint32_t(x_); }}", v(insn.operands[1]), 1u << insn.operands[2], v(insn.operands[0]));
++        break;
++
++    // ---- Forgotten Sands additions: instructions this game uses that are still missing ----
++    case PPC_INST_VNOR:
++    case PPC_INST_VNOR128:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_xor_si128(simde_mm_or_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_set1_epi32(-1)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSUBUWS:
++        println("\tfor (int i_ = 0; i_ < 4; i_++) {}.u32[i_] = {}.u32[i_] > {}.u32[i_] ? {}.u32[i_] - {}.u32[i_] : 0u;", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VADDSWS:
++        println("\tfor (int i_ = 0; i_ < 4; i_++) {{ int64_t s_ = int64_t({}.s32[i_]) + int64_t({}.s32[i_]); {}.s32[i_] = s_ > INT_MAX ? INT_MAX : s_ < INT_MIN ? INT_MIN : int32_t(s_); }}", v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VSUBSHS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_subs_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VADDUHS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_adds_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSPLTISH:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_set1_epi16(short(0x{:X})));", v(insn.operands[0]), insn.operands[1] & 0xFFFF);
++        break;
++
++    case PPC_INST_VPKUWUM:
++        // Low halfword of each word, vA's words first (big-endian). With the vector byte-reversed in host
++        // memory, host halfwords 0-3 come from vB and 4-7 from vA.
++        println("\t{{ uint16_t h_[8]; for (int i_ = 0; i_ < 4; i_++) {{ h_[i_] = uint16_t({}.u32[i_]); h_[i_ + 4] = uint16_t({}.u32[i_]); }} memcpy({}.u16, h_, 16); }}", v(insn.operands[2]), v(insn.operands[1]), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_MULHDU:
++        println("\t{}.u64 = uint64_t((__uint128_t({}.u64) * __uint128_t({}.u64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        break;
++
++    case PPC_INST_FRSQRTE:
++        printSetFlushMode(false);
++        println("\t{}.f64 = 1.0 / sqrt({}.f64);", f(insn.operands[0]), f(insn.operands[1]));
++        break;
++
++    case PPC_INST_FNMADD:
++        printSetFlushMode(false);
++        println("\t{}.f64 = -({}.f64 * {}.f64 + {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        break;
++
++    case PPC_INST_DCBST:
++        // no op (cache store)
++        break;
++
+     default:
+         return false;
+     }
+@@ -2284,6 +2623,12 @@ bool Recompiler::Recompile(
+ 
+ bool Recompiler::Recompile(const Function& fn)
+ {
++    // Torchlight Step 11: per-function register locals (safe_locals)
++    {
++        const bool ctxOnly = config.safeLocals && (ctxOnlyFunctions.count(uint32_t(fn.base)) != 0);
++        fnNonArgLocals = config.nonArgumentRegistersAsLocalVariables && !ctxOnly;
++        fnNonVolatileLocals = config.nonVolatileRegistersAsLocalVariables && !ctxOnly;
++    }
+     auto base = fn.base;
+     auto end = base + fn.size;
+     auto* data = (uint32_t*)image.Find(base);
+@@ -2500,6 +2845,339 @@ bool Recompiler::Recompile(const Function& fn)
+     return allRecompiled;
+ }
+ 
++// Torchlight Step 11 (config safe_locals = true): non_argument_as_local / non_volatile_as_local
++// turned on per function. A register kept in a C++ local is invisible to every other function, which
++// is only correct if no function reads a register value that another function left there outside the
++// ABI. Functions that must keep every register in ctx ("ctx-only"):
++//  1. functions that read r0/r2/r11/r12/r14-r31, f0/f14-f31, v14-v127 before writing them (linear
++//     scan; storing a not yet written register to the stack through r1/r12 is a prolog save and does
++//     not count): MSVC __finally funclets (read the parent's r12/r30/r31), split pieces of one real
++//     function (XenonRecomp boundaries, jump-table gap functions), __chkstk (size in r12), ...
++//  2. functions that read r0/r11/r12/f0/v32-v63 after a call before writing them (a non-ABI value
++//     returned in a volatile register), and the function called right before;
++//  3. every function that calls or branches to a function of (1) or into the middle of a function;
++//  4. functions that call setjmp (the whole ctx is copied and restored around it), call
++//     _local_unwind or have an MSVC __C_specific_handler scope table (RtlUnwind runs their
++//     __finally funclets with the parent's ctx), the funclets themselves, and the
++//     __save* / __rest* register helpers.
++// Everything else keeps r14-r31 etc. as C++ locals, so the host compiler can keep them in registers.
++static bool SW(std::string_view s, std::string_view p) { return s.size() >= p.size() && s.compare(0, p.size(), p) == 0; }
++static bool EW(std::string_view s, std::string_view p) { return s.size() >= p.size() && s.compare(s.size() - p.size(), p.size(), p) == 0; }
++
++void Recompiler::AnalyseLocalSafety()
++{
++    std::vector<std::pair<uint32_t, size_t>> bases; // function start -> index
++    bases.reserve(functions.size());
++    for (size_t i = 0; i < functions.size(); i++)
++        bases.emplace_back(uint32_t(functions[i].base), i);
++    std::sort(bases.begin(), bases.end());
++    auto containing = [&](uint32_t addr) -> int64_t
++    {
++        auto it = std::upper_bound(bases.begin(), bases.end(), std::make_pair(addr, SIZE_MAX));
++        if (it == bases.begin()) return -1;
++        --it;
++        const Function& fn = functions[it->second];
++        return (addr >= fn.base && addr < fn.base + fn.size) ? int64_t(it->second) : -1;
++    };
++
++    // register key: 0-31 r, 32-63 f, 64-191 v
++    auto candidate = [](int key)
++    {
++        if (key < 32) return key == 0 || key == 2 || key == 11 || key == 12 || key >= 14;
++        if (key < 64) { const int f = key - 32; return f == 0 || f >= 14; }
++        const int v = key - 64;
++        return v >= 14;
++    };
++    auto volatileCandidate = [](int key)
++    {
++        if (key < 32) return key == 0 || key == 11 || key == 12;
++        if (key < 64) return key == 32;
++        const int v = key - 64;
++        return v >= 32 && v <= 63;
++    };
++
++    std::vector<uint8_t> rbw(functions.size()), ctxOnly(functions.size());
++    std::vector<std::string> why(functions.size());
++    std::vector<std::vector<uint32_t>> targets(functions.size());
++    size_t reasons[6]{};
++
++    for (size_t i = 0; i < functions.size(); i++)
++    {
++        const Function& fn = functions[i];
++        auto* data = (const uint32_t*)image.Find(fn.base);
++        if (data == nullptr) { ctxOnly[i] = 1; continue; }
++
++        auto symbol = image.symbols.find(fn.base);
++        if (symbol != image.symbols.end() && (symbol->name.find("__save") == 0 || symbol->name.find("__rest") == 0))
++            ctxOnly[i] = 1, reasons[3]++;
++
++        // MSVC SEH scope table in front of the function: handler thunk at -8, scope table at -4
++        if (config.sehHandlerThunkAddress != 0)
++        {
++            auto* pre = (const uint32_t*)image.Find(fn.base - 8);
++            if (pre && ByteSwap(pre[0]) == config.sehHandlerThunkAddress)
++            {
++                ctxOnly[i] = 1, reasons[4]++;
++                auto* table = (const uint32_t*)image.Find(ByteSwap(pre[1]));
++                if (table)
++                {
++                    const uint32_t count = ByteSwap(table[0]);
++                    for (uint32_t s = 0; s < count && s < 64; s++)
++                    {
++                        const uint32_t handler = ByteSwap(table[1 + s * 4 + 2]);
++                        const int64_t h = containing(handler);
++                        if (h >= 0) ctxOnly[size_t(h)] = 1;
++                    }
++                }
++            }
++        }
++
++        // decode: per instruction the register written, the registers read, calls and successors
++        const size_t n = fn.size / 4;
++        struct Ins
++        {
++            int dest = -1, dest2 = -1;
++            int reads[8]; int nReads = 0;
++            bool save = false;        // reads[0] is a prolog save ("stw r31,-8(r1)") when not written yet
++            bool call = false;
++            int callTarget = -1;      // index into targets[i]
++            int succ[2] = { -1, -1 }; // in-function successors (instruction index)
++            std::vector<int> table;   // switch-table successors
++        };
++        std::vector<Ins> code(n);
++        const uint32_t* insData = data;
++        bool computedJump = false; // a bctr without a switch table: some code may be reached that the CFG misses
++        for (size_t k = 0; k < n; k++)
++        {
++            const uint32_t addr = uint32_t(fn.base + k * 4);
++            const uint32_t instruction = ByteSwap(insData[k]);
++            const size_t op = PPC_OP(instruction);
++            Ins& in = code[k];
++            auto local = [&](uint32_t a) -> int { return (a >= fn.base && a < fn.base + fn.size) ? int((a - fn.base) / 4) : -1; };
++            bool fallthrough = true;
++            if (op == PPC_OP_B || op == PPC_OP_BC)
++            {
++                const uint32_t target = op == PPC_OP_B ? uint32_t(addr + PPC_BI(instruction)) : uint32_t(addr + PPC_BD(instruction));
++                const bool link = PPC_BL(instruction);
++                if ((instruction & 2) == 0 && local(target) < 0)
++                {
++                    targets[i].push_back(target);
++                    if (target == config.setJmpAddress && config.setJmpAddress != 0) ctxOnly[i] = 1, reasons[5]++;
++                    if (target == config.localUnwindAddress && config.localUnwindAddress != 0) ctxOnly[i] = 1, reasons[4]++;
++                    if (link) { in.call = true; in.callTarget = int(targets[i].size() - 1); }
++                }
++                else if ((instruction & 2) == 0 && !link)
++                    in.succ[1] = local(target);
++                // unconditional b (or bc "branch always", BO = 1z1zz) without link ends the block
++                const uint32_t bo = (instruction >> 21) & 31;
++                if (!link && (op == PPC_OP_B || (bo & 0x14) == 0x14))
++                    fallthrough = false;
++                if (link) in.call = true;
++            }
++            else if (op == 19)
++            {
++                const uint32_t xo = (instruction >> 1) & 0x3FF;
++                const uint32_t bo = (instruction >> 21) & 31;
++                const bool link = instruction & 1;
++                if ((xo == 16 || xo == 528) && !link && (bo & 0x14) == 0x14)
++                    fallthrough = false; // blr / bctr
++                if (xo == 528 && link)
++                    in.call = true;      // bctrl: indirect call
++                auto sw = config.switchTables.find(addr);
++                if (xo == 528 && sw != config.switchTables.end())
++                    for (auto label : sw->second.labels)
++                        if (local(label) >= 0) in.table.push_back(local(label));
++                if (xo == 528 && !link && sw == config.switchTables.end())
++                    computedJump = true;
++            }
++            if (fallthrough && k + 1 < n)
++                in.succ[0] = int(k + 1);
++            if (op == PPC_OP_B || op == PPC_OP_BC || op == 19)
++                continue; // no GPR/FPR/VR operands
++
++            ppc_insn insn;
++            ppc::Disassemble(insData + k, 4, addr, insn);
++            if (insn.opcode == nullptr)
++                continue;
++            const std::string_view name = insn.opcode->name;
++            const bool noDest = SW(name, "st") || SW(name, "cmp") || SW(name, "fcmp") || SW(name, "mt") ||
++                SW(name, "tw") || SW(name, "td") || SW(name, "dcb") || SW(name, "icb") ||
++                name == "sync" || name == "eieio" || name == "isync" || name == "lwsync";
++            const bool isStore = SW(name, "st");
++
++            struct Tok { int key; bool base; };
++            Tok toks[8];
++            int nt = 0;
++            const char* s = insn.op_str;
++            for (size_t p = 0; s[p] != 0 && nt < 8; )
++            {
++                const char c = s[p];
++                const bool start = (p == 0 || s[p - 1] == ',' || s[p - 1] == '(' || s[p - 1] == ' ');
++                if (start && (c == 'r' || c == 'f' || c == 'v') && isdigit((unsigned char)s[p + 1]))
++                {
++                    size_t q = p + 1;
++                    int num = 0;
++                    while (isdigit((unsigned char)s[q])) num = num * 10 + (s[q++] - '0');
++                    if (s[q] == 0 || s[q] == ',' || s[q] == ')' || s[q] == ' ')
++                    {
++                        if ((c == 'r' && num < 32) || (c == 'f' && num < 32) || (c == 'v' && num < 128))
++                            toks[nt++] = Tok{ c == 'r' ? num : c == 'f' ? 32 + num : 64 + num, p > 0 && s[p - 1] == '(' };
++                    }
++                    p = q;
++                }
++                else
++                    p++;
++            }
++            // rA = r0 in a load / store / cache instruction means the constant 0, not a register
++            const bool cacheOp = SW(name, "dcb") || SW(name, "icb");
++            const bool memOp = cacheOp || SW(name, "st") || (SW(name, "l") && !SW(name, "li"));
++            const int raIndex = cacheOp ? 0 : 1;
++            // traps ("twi 31,r0,22" = debug break) produce nothing; their operands are not data reads
++            const bool trap = SW(name, "tw") || SW(name, "td");
++            for (int t = noDest ? 0 : 1; t < nt && !trap; t++)
++                if (candidate(toks[t].key) && !(memOp && t == raIndex && toks[t].key == 0))
++                {
++                    if (t == 0 && isStore && nt >= 2 && toks[nt - 1].base && (toks[nt - 1].key == 1 || toks[nt - 1].key == 12))
++                        in.save = true;
++                    in.reads[in.nReads++] = toks[t].key;
++                }
++            if (!noDest && nt > 0)
++                in.dest = toks[0].key;
++            if ((EW(name, "u") || EW(name, "ux")) && nt >= 2)
++                in.dest2 = toks[nt - 1].key;
++            if (SW(name, "lmw") && nt > 0) // load multiple: rD..r31
++                in.dest2 = -2;
++        }
++
++        // forward dataflow: W = registers written on every path from the entry (must),
++        // C = volatile registers a call may have clobbered on some path since they were last written (may)
++        using Bits = std::bitset<192>;
++        Bits volatileMask;
++        for (int k = 0; k < 192; k++) if (volatileCandidate(k)) volatileMask.set(k);
++        std::vector<Bits> inW(n), inC(n);
++        std::vector<uint8_t> reached(n);
++        std::vector<int> work;
++        if (n > 0) { reached[0] = 1; work.push_back(0); }
++        while (!work.empty())
++        {
++            const int k = work.back(); work.pop_back();
++            Bits w = inW[k], c = inC[k];
++            const Ins& in = code[k];
++            if (in.dest >= 0) { w.set(in.dest); c.reset(in.dest); }
++            if (in.dest2 >= 0) { w.set(in.dest2); c.reset(in.dest2); }
++            if (in.dest2 == -2 && in.dest >= 0) for (int r = in.dest; r < 32; r++) { w.set(r); c.reset(r); }
++            if (in.call) c |= volatileMask;
++            auto flow = [&](int s)
++            {
++                if (s < 0) return;
++                if (!reached[s]) { reached[s] = 1; inW[s] = w; inC[s] = c; work.push_back(s); return; }
++                const Bits nw = inW[s] & w, nc = inC[s] | c;
++                if (nw != inW[s] || nc != inC[s]) { inW[s] = nw; inC[s] = nc; work.push_back(s); }
++            };
++            flow(in.succ[0]);
++            flow(in.succ[1]);
++            for (int s : in.table) flow(s);
++        }
++        int lastCall = -1;
++        for (size_t k = 0; k < n; k++)
++        {
++            const Ins& in = code[k];
++            if (in.call && in.callTarget >= 0) lastCall = in.callTarget;
++            if (!reached[k])
++            {
++                // code the in-function control flow does not reach. With a computed jump (bctr without a
++                // switch table) its register state is unknown, so a register read there counts as
++                // read-before-write. Without one it is only entered by exception dispatch (__except
++                // blocks, e.g. in __RTDynamicCast), which never runs in this game (no RtlRaiseException).
++                if (computedJump && in.nReads > 0 && !(in.nReads == 1 && in.save))
++                {
++                    if (!rbw[i]) reasons[2]++;
++                    rbw[i] = 1;
++                    if (why[i].empty()) why[i] = fmt::format(" unreached {:X}", fn.base + k * 4);
++                }
++                continue;
++            }
++            for (int t = 0; t < in.nReads; t++)
++            {
++                const int key = in.reads[t];
++                const bool unwritten = !inW[k].test(key);
++                const bool clobbered = inC[k].test(key);
++                if (!unwritten && !clobbered) continue;
++                if (t == 0 && in.save && unwritten) continue;
++                if (why[i].empty())
++                {
++                    ppc_insn insn;
++                    ppc::Disassemble(insData + k, 4, uint32_t(fn.base + k * 4), insn);
++                    why[i] = fmt::format(" {} {:X} {} {}", unwritten ? "rbw" : "vol", fn.base + k * 4, insn.opcode ? insn.opcode->name : "?", insn.op_str);
++                }
++                if (unwritten)
++                    rbw[i] = 1;
++                else
++                {
++                    ctxOnly[i] = 1, reasons[1]++;
++                    if (lastCall >= 0)
++                    {
++                        const int64_t callee = containing(targets[i][size_t(lastCall)]);
++                        if (callee >= 0) ctxOnly[size_t(callee)] = 1;
++                    }
++                }
++            }
++        }
++    }
++
++    size_t rbwCount = 0;
++    for (size_t i = 0; i < functions.size(); i++)
++        if (rbw[i]) { ctxOnly[i] = 1; rbwCount++; }
++    reasons[0] = rbwCount;
++    // callers / branchers of the functions that read registers they did not write
++    size_t propagated = 0;
++    std::unordered_map<size_t, size_t> blame; // function -> callers it made ctx-only
++    for (size_t i = 0; i < functions.size(); i++)
++    {
++        if (ctxOnly[i]) continue;
++        for (uint32_t t : targets[i])
++        {
++            const int64_t j = containing(t);
++            if (j < 0) continue;
++            const bool mid = uint32_t(functions[size_t(j)].base) != t; // a jump into the middle of another function
++            // calls of the __save* / __rest* register helpers are left out of local functions entirely
++            auto sym = image.symbols.find(functions[size_t(j)].base);
++            if (!mid && sym != image.symbols.end() && (sym->name.find("__save") == 0 || sym->name.find("__rest") == 0))
++                continue;
++            if (rbw[size_t(j)] || mid)
++            {
++                blame[size_t(j)]++;
++                ctxOnly[i] = 1;
++                if (mid) ctxOnly[size_t(j)] = 1;
++                propagated++;
++                break;
++            }
++        }
++    }
++
++    ctxOnlyFunctions.clear();
++    for (size_t i = 0; i < functions.size(); i++)
++        if (ctxOnly[i]) ctxOnlyFunctions.insert(uint32_t(functions[i].base));
++    fmt::println("safe_locals: {} of {} functions keep registers in ctx (read-before-write {}, volatile after call {}, "
++        "callers {}, helpers {}, SEH/local unwind {}, setjmp {})", ctxOnlyFunctions.size(), functions.size(), reasons[0], reasons[1],
++        propagated, reasons[3], reasons[4], reasons[5]);
++
++    // list for review
++    std::string list;
++    {
++        std::vector<std::pair<size_t, size_t>> top(blame.begin(), blame.end());
++        std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second > b.second; });
++        for (size_t k = 0; k < top.size() && k < 40; k++)
++            list += fmt::format("# blame {:X}: {} callers{}\n", functions[top[k].first].base, top[k].second, why[top[k].first]);
++    }
++    for (size_t i = 0; i < functions.size(); i++)
++        if (ctxOnly[i]) list += fmt::format("{:X}{}\n", functions[i].base, why[i]);
++    std::string directoryPath = config.directoryPath;
++    if (!directoryPath.empty()) directoryPath += "/";
++    FILE* f = fopen(fmt::format("{}{}/safe_locals_ctx_only.txt", directoryPath, config.outDirectoryPath).c_str(), "wb");
++    if (f) { fwrite(list.data(), 1, list.size(), f); fclose(f); }
++}
++
+ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+ {
+     out.reserve(10 * 1024 * 1024);
+@@ -2522,9 +3200,10 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+             println("#define PPC_CONFIG_SKIP_MSR");      
+         if (config.crRegistersAsLocalVariables)
+             println("#define PPC_CONFIG_CR_AS_LOCAL");      
+-        if (config.nonArgumentRegistersAsLocalVariables)
++        // (safe_locals: ctx keeps every register, the functions that must use ctx still need them)
++        if (config.nonArgumentRegistersAsLocalVariables && !config.safeLocals)
+             println("#define PPC_CONFIG_NON_ARGUMENT_AS_LOCAL");   
+-        if (config.nonVolatileRegistersAsLocalVariables)
++        if (config.nonVolatileRegistersAsLocalVariables && !config.safeLocals)
+             println("#define PPC_CONFIG_NON_VOLATILE_AS_LOCAL");
+ 
+         println("");
+@@ -2602,6 +3281,9 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+         SaveCurrentOutData("ppc_func_mapping.cpp");
+     }
+ 
++    if (config.safeLocals)
++        AnalyseLocalSafety();
++
+     for (size_t i = 0; i < functions.size(); i++)
+     {
+         if ((i % 256) == 0)
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 8242db5..91208b5 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -1,70 +1,77 @@
+-#pragma once
+-
+-#include "pch.h"
+-#include "recompiler_config.h"
+-
+-struct RecompilerLocalVariables
+-{
+-    bool ctr{};
+-    bool xer{};
+-    bool reserved{};
+-    bool cr[8]{};
+-    bool r[32]{};
+-    bool f[32]{};
+-    bool v[128]{};
+-    bool env{};
+-    bool temp{};
+-    bool vTemp{};
+-    bool ea{};
+-};
+-
+-enum class CSRState
+-{
+-    Unknown,
+-    FPU,
+-    VMX
+-};
+-
+-struct Recompiler
+-{
+-    // Enforce In-order Execution of I/O constant for quick comparison
+-    static constexpr uint32_t c_eieio = 0xAC06007C;
+-    Image image;
+-    std::vector<Function> functions;
+-    std::string out;
+-    size_t cppFileIndex = 0;
+-    RecompilerConfig config;
+-
+-    bool LoadConfig(const std::string_view& configFilePath);
+-
+-    template<class... Args>
+-    void print(fmt::format_string<Args...> fmt, Args&&... args)
+-    {
+-        fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
+-    }
+-
+-    template<class... Args>
+-    void println(fmt::format_string<Args...> fmt, Args&&... args)
+-    {
+-        fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
+-        out += '\n';
+-    }
+-
+-    void Analyse();
+-
+-    // TODO: make a RecompileArgs struct instead this is getting messy
+-    bool Recompile(
+-        const Function& fn,
+-        uint32_t base,
+-        const ppc_insn& insn,
+-        const uint32_t* data,
+-        std::unordered_map<uint32_t, RecompilerSwitchTable>::iterator& switchTable,
+-        RecompilerLocalVariables& localVariables,
+-        CSRState& csrState);
+-
+-    bool Recompile(const Function& fn);
+-
+-    void Recompile(const std::filesystem::path& headerFilePath);
+-
+-    void SaveCurrentOutData(const std::string_view& name = std::string_view());
+-};
++#pragma once
++
++#include "pch.h"
++#include "recompiler_config.h"
++
++struct RecompilerLocalVariables
++{
++    bool ctr{};
++    bool xer{};
++    bool reserved{};
++    bool cr[8]{};
++    bool r[32]{};
++    bool f[32]{};
++    bool v[128]{};
++    bool env{};
++    bool temp{};
++    bool vTemp{};
++    bool ea{};
++};
++
++enum class CSRState
++{
++    Unknown,
++    FPU,
++    VMX
++};
++
++struct Recompiler
++{
++    // Enforce In-order Execution of I/O constant for quick comparison
++    static constexpr uint32_t c_eieio = 0xAC06007C;
++    Image image;
++    std::vector<Function> functions;
++    std::string out;
++    size_t cppFileIndex = 0;
++    RecompilerConfig config;
++
++    // Torchlight Step 11 (safe_locals): functions that must keep all registers in ctx, and the
++    // switches for the function being emitted.
++    std::unordered_set<uint32_t> ctxOnlyFunctions;
++    bool fnNonArgLocals = false;
++    bool fnNonVolatileLocals = false;
++    void AnalyseLocalSafety();
++
++    bool LoadConfig(const std::string_view& configFilePath);
++
++    template<class... Args>
++    void print(fmt::format_string<Args...> fmt, Args&&... args)
++    {
++        fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
++    }
++
++    template<class... Args>
++    void println(fmt::format_string<Args...> fmt, Args&&... args)
++    {
++        fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
++        out += '\n';
++    }
++
++    void Analyse();
++
++    // TODO: make a RecompileArgs struct instead this is getting messy
++    bool Recompile(
++        const Function& fn,
++        uint32_t base,
++        const ppc_insn& insn,
++        const uint32_t* data,
++        std::unordered_map<uint32_t, RecompilerSwitchTable>::iterator& switchTable,
++        RecompilerLocalVariables& localVariables,
++        CSRState& csrState);
++
++    bool Recompile(const Function& fn);
++
++    void Recompile(const std::filesystem::path& headerFilePath);
++
++    void SaveCurrentOutData(const std::string_view& name = std::string_view());
++};
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index 81330a4..ce6f2d8 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -1,137 +1,141 @@
+-#include "recompiler_config.h"
+-
+-void RecompilerConfig::Load(const std::string_view& configFilePath)
+-{
+-    directoryPath = configFilePath.substr(0, configFilePath.find_last_of("\\/") + 1);
+-    toml::table toml = toml::parse_file(configFilePath)
+-#if !TOML_EXCEPTIONS
+-        .table()
+-#endif
+-        ;
+-
+-    if (auto mainPtr = toml["main"].as_table())
+-    {
+-        const auto& main = *mainPtr;
+-        filePath = main["file_path"].value_or<std::string>("");
+-        patchFilePath = main["patch_file_path"].value_or<std::string>("");
+-        patchedFilePath = main["patched_file_path"].value_or<std::string>("");
+-        outDirectoryPath = main["out_directory_path"].value_or<std::string>("");
+-        switchTableFilePath = main["switch_table_file_path"].value_or<std::string>("");
+-
+-        skipLr = main["skip_lr"].value_or(false);
+-        skipMsr = main["skip_msr"].value_or(false);
+-        ctrAsLocalVariable = main["ctr_as_local"].value_or(false);
+-        xerAsLocalVariable = main["xer_as_local"].value_or(false);
+-        reservedRegisterAsLocalVariable = main["reserved_as_local"].value_or(false);
+-        crRegistersAsLocalVariables = main["cr_as_local"].value_or(false);
+-        nonArgumentRegistersAsLocalVariables = main["non_argument_as_local"].value_or(false);
+-        nonVolatileRegistersAsLocalVariables = main["non_volatile_as_local"].value_or(false);
+-
+-        restGpr14Address = main["restgprlr_14_address"].value_or(0u);
+-        saveGpr14Address = main["savegprlr_14_address"].value_or(0u);
+-        restFpr14Address = main["restfpr_14_address"].value_or(0u);
+-        saveFpr14Address = main["savefpr_14_address"].value_or(0u);
+-        restVmx14Address = main["restvmx_14_address"].value_or(0u);
+-        saveVmx14Address = main["savevmx_14_address"].value_or(0u);
+-        restVmx64Address = main["restvmx_64_address"].value_or(0u);
+-        saveVmx64Address = main["savevmx_64_address"].value_or(0u);
+-        longJmpAddress = main["longjmp_address"].value_or(0u);
+-        setJmpAddress = main["setjmp_address"].value_or(0u);
+-
+-        if (restGpr14Address == 0) fmt::println("ERROR: __restgprlr_14 address is unspecified");
+-        if (saveGpr14Address == 0) fmt::println("ERROR: __savegprlr_14 address is unspecified");
+-        if (restFpr14Address == 0) fmt::println("ERROR: __restfpr_14 address is unspecified");
+-        if (saveFpr14Address == 0) fmt::println("ERROR: __savefpr_14 address is unspecified");
+-        if (restVmx14Address == 0) fmt::println("ERROR: __restvmx_14 address is unspecified");
+-        if (saveVmx14Address == 0) fmt::println("ERROR: __savevmx_14 address is unspecified");
+-        if (restVmx64Address == 0) fmt::println("ERROR: __restvmx_64 address is unspecified");
+-        if (saveVmx64Address == 0) fmt::println("ERROR: __savevmx_64 address is unspecified");
+-
+-        if (auto functionsArray = main["functions"].as_array())
+-        {
+-            for (auto& func : *functionsArray)
+-            {
+-                auto& funcTable = *func.as_table();
+-                uint32_t address = *funcTable["address"].value<uint32_t>();
+-                uint32_t size = *funcTable["size"].value<uint32_t>();
+-                functions.emplace(address, size);
+-            }
+-        }
+-
+-        if (auto invalidArray = main["invalid_instructions"].as_array())
+-        {
+-            for (auto& instr : *invalidArray)
+-            {
+-                auto& instrTable = *instr.as_table();
+-                uint32_t data = *instrTable["data"].value<uint32_t>();
+-                uint32_t size = *instrTable["size"].value<uint32_t>();
+-                invalidInstructions.emplace(data, size);
+-            }
+-        }
+-
+-        if (!switchTableFilePath.empty())
+-        {
+-            toml::table switchToml = toml::parse_file(directoryPath + switchTableFilePath)
+-#if !TOML_EXCEPTIONS
+-                .table()
+-#endif
+-                ;
+-            if (auto switchArray = switchToml["switch"].as_array())
+-            {
+-                for (auto& entry : *switchArray)
+-                {
+-                    auto& table = *entry.as_table();
+-                    RecompilerSwitchTable switchTable;
+-                    switchTable.r = *table["r"].value<uint32_t>();
+-                    for (auto& label : *table["labels"].as_array())
+-                    {
+-                        switchTable.labels.push_back(*label.value<uint32_t>());
+-                    }
+-                    switchTables.emplace(*table["base"].value<uint32_t>(), std::move(switchTable));
+-                }
+-            }
+-        }
+-    }
+-
+-    if (auto midAsmHookArray = toml["midasm_hook"].as_array())
+-    {
+-        for (auto& entry : *midAsmHookArray)
+-        {
+-            auto& table = *entry.as_table();
+-
+-            RecompilerMidAsmHook midAsmHook;
+-            midAsmHook.name = *table["name"].value<std::string>();
+-            if (auto registerArray = table["registers"].as_array())
+-            {
+-                for (auto& reg : *registerArray)
+-                    midAsmHook.registers.push_back(*reg.value<std::string>());
+-            }
+-
+-            midAsmHook.ret = table["return"].value_or(false);
+-            midAsmHook.returnOnTrue = table["return_on_true"].value_or(false);
+-            midAsmHook.returnOnFalse = table["return_on_false"].value_or(false);
+-
+-            midAsmHook.jumpAddress = table["jump_address"].value_or(0u);
+-            midAsmHook.jumpAddressOnTrue = table["jump_address_on_true"].value_or(0u);
+-            midAsmHook.jumpAddressOnFalse = table["jump_address_on_false"].value_or(0u);
+-
+-            if ((midAsmHook.ret && midAsmHook.jumpAddress != NULL) ||
+-                (midAsmHook.returnOnTrue && midAsmHook.jumpAddressOnTrue != NULL) ||
+-                (midAsmHook.returnOnFalse && midAsmHook.jumpAddressOnFalse != NULL))
+-            {
+-                fmt::println("{}: can't return and jump at the same time", midAsmHook.name);
+-            }
+-
+-            if ((midAsmHook.ret || midAsmHook.jumpAddress != NULL) &&
+-                (midAsmHook.returnOnFalse != NULL || midAsmHook.returnOnTrue != NULL ||
+-                    midAsmHook.jumpAddressOnFalse != NULL || midAsmHook.jumpAddressOnTrue != NULL))
+-            {
+-                fmt::println("{}: can't mix direct and conditional return/jump", midAsmHook.name);
+-            }
+-
+-            midAsmHook.afterInstruction = table["after_instruction"].value_or(false);
+-
+-            midAsmHooks.emplace(*table["address"].value<uint32_t>(), std::move(midAsmHook));
+-        }
+-    }
+-}
++#include "recompiler_config.h"
++
++void RecompilerConfig::Load(const std::string_view& configFilePath)
++{
++    directoryPath = configFilePath.substr(0, configFilePath.find_last_of("\\/") + 1);
++    toml::table toml = toml::parse_file(configFilePath)
++#if !TOML_EXCEPTIONS
++        .table()
++#endif
++        ;
++
++    if (auto mainPtr = toml["main"].as_table())
++    {
++        const auto& main = *mainPtr;
++        filePath = main["file_path"].value_or<std::string>("");
++        patchFilePath = main["patch_file_path"].value_or<std::string>("");
++        patchedFilePath = main["patched_file_path"].value_or<std::string>("");
++        outDirectoryPath = main["out_directory_path"].value_or<std::string>("");
++        switchTableFilePath = main["switch_table_file_path"].value_or<std::string>("");
++
++        skipLr = main["skip_lr"].value_or(false);
++        skipMsr = main["skip_msr"].value_or(false);
++        ctrAsLocalVariable = main["ctr_as_local"].value_or(false);
++        xerAsLocalVariable = main["xer_as_local"].value_or(false);
++        reservedRegisterAsLocalVariable = main["reserved_as_local"].value_or(false);
++        crRegistersAsLocalVariables = main["cr_as_local"].value_or(false);
++        nonArgumentRegistersAsLocalVariables = main["non_argument_as_local"].value_or(false);
++        nonVolatileRegistersAsLocalVariables = main["non_volatile_as_local"].value_or(false);
++
++        restGpr14Address = main["restgprlr_14_address"].value_or(0u);
++        saveGpr14Address = main["savegprlr_14_address"].value_or(0u);
++        restFpr14Address = main["restfpr_14_address"].value_or(0u);
++        saveFpr14Address = main["savefpr_14_address"].value_or(0u);
++        restVmx14Address = main["restvmx_14_address"].value_or(0u);
++        saveVmx14Address = main["savevmx_14_address"].value_or(0u);
++        restVmx64Address = main["restvmx_64_address"].value_or(0u);
++        saveVmx64Address = main["savevmx_64_address"].value_or(0u);
++        longJmpAddress = main["longjmp_address"].value_or(0u);
++        setJmpAddress = main["setjmp_address"].value_or(0u);
++        // Torchlight Step 11: per-function locals (see Recompiler::AnalyseLocalSafety)
++        safeLocals = main["safe_locals"].value_or(false);
++        localUnwindAddress = main["local_unwind_address"].value_or(0u);
++        sehHandlerThunkAddress = main["seh_handler_thunk_address"].value_or(0u);
++
++        if (restGpr14Address == 0) fmt::println("ERROR: __restgprlr_14 address is unspecified");
++        if (saveGpr14Address == 0) fmt::println("ERROR: __savegprlr_14 address is unspecified");
++        if (restFpr14Address == 0) fmt::println("ERROR: __restfpr_14 address is unspecified");
++        if (saveFpr14Address == 0) fmt::println("ERROR: __savefpr_14 address is unspecified");
++        if (restVmx14Address == 0) fmt::println("ERROR: __restvmx_14 address is unspecified");
++        if (saveVmx14Address == 0) fmt::println("ERROR: __savevmx_14 address is unspecified");
++        if (restVmx64Address == 0) fmt::println("ERROR: __restvmx_64 address is unspecified");
++        if (saveVmx64Address == 0) fmt::println("ERROR: __savevmx_64 address is unspecified");
++
++        if (auto functionsArray = main["functions"].as_array())
++        {
++            for (auto& func : *functionsArray)
++            {
++                auto& funcTable = *func.as_table();
++                uint32_t address = *funcTable["address"].value<uint32_t>();
++                uint32_t size = *funcTable["size"].value<uint32_t>();
++                functions.emplace(address, size);
++            }
++        }
++
++        if (auto invalidArray = main["invalid_instructions"].as_array())
++        {
++            for (auto& instr : *invalidArray)
++            {
++                auto& instrTable = *instr.as_table();
++                uint32_t data = *instrTable["data"].value<uint32_t>();
++                uint32_t size = *instrTable["size"].value<uint32_t>();
++                invalidInstructions.emplace(data, size);
++            }
++        }
++
++        if (!switchTableFilePath.empty())
++        {
++            toml::table switchToml = toml::parse_file(directoryPath + switchTableFilePath)
++#if !TOML_EXCEPTIONS
++                .table()
++#endif
++                ;
++            if (auto switchArray = switchToml["switch"].as_array())
++            {
++                for (auto& entry : *switchArray)
++                {
++                    auto& table = *entry.as_table();
++                    RecompilerSwitchTable switchTable;
++                    switchTable.r = *table["r"].value<uint32_t>();
++                    for (auto& label : *table["labels"].as_array())
++                    {
++                        switchTable.labels.push_back(*label.value<uint32_t>());
++                    }
++                    switchTables.emplace(*table["base"].value<uint32_t>(), std::move(switchTable));
++                }
++            }
++        }
++    }
++
++    if (auto midAsmHookArray = toml["midasm_hook"].as_array())
++    {
++        for (auto& entry : *midAsmHookArray)
++        {
++            auto& table = *entry.as_table();
++
++            RecompilerMidAsmHook midAsmHook;
++            midAsmHook.name = *table["name"].value<std::string>();
++            if (auto registerArray = table["registers"].as_array())
++            {
++                for (auto& reg : *registerArray)
++                    midAsmHook.registers.push_back(*reg.value<std::string>());
++            }
++
++            midAsmHook.ret = table["return"].value_or(false);
++            midAsmHook.returnOnTrue = table["return_on_true"].value_or(false);
++            midAsmHook.returnOnFalse = table["return_on_false"].value_or(false);
++
++            midAsmHook.jumpAddress = table["jump_address"].value_or(0u);
++            midAsmHook.jumpAddressOnTrue = table["jump_address_on_true"].value_or(0u);
++            midAsmHook.jumpAddressOnFalse = table["jump_address_on_false"].value_or(0u);
++
++            if ((midAsmHook.ret && midAsmHook.jumpAddress != NULL) ||
++                (midAsmHook.returnOnTrue && midAsmHook.jumpAddressOnTrue != NULL) ||
++                (midAsmHook.returnOnFalse && midAsmHook.jumpAddressOnFalse != NULL))
++            {
++                fmt::println("{}: can't return and jump at the same time", midAsmHook.name);
++            }
++
++            if ((midAsmHook.ret || midAsmHook.jumpAddress != NULL) &&
++                (midAsmHook.returnOnFalse != NULL || midAsmHook.returnOnTrue != NULL ||
++                    midAsmHook.jumpAddressOnFalse != NULL || midAsmHook.jumpAddressOnTrue != NULL))
++            {
++                fmt::println("{}: can't mix direct and conditional return/jump", midAsmHook.name);
++            }
++
++            midAsmHook.afterInstruction = table["after_instruction"].value_or(false);
++
++            midAsmHooks.emplace(*table["address"].value<uint32_t>(), std::move(midAsmHook));
++        }
++    }
++}
+diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
+index 534e503..efbb535 100644
+--- a/XenonRecomp/recompiler_config.h
++++ b/XenonRecomp/recompiler_config.h
+@@ -1,57 +1,62 @@
+-#pragma once
+-
+-struct RecompilerSwitchTable
+-{
+-    uint32_t r;
+-    std::vector<uint32_t> labels;
+-};
+-
+-struct RecompilerMidAsmHook
+-{
+-    std::string name;
+-    std::vector<std::string> registers;
+-
+-    bool ret = false;
+-    bool returnOnTrue = false;
+-    bool returnOnFalse = false;
+-
+-    uint32_t jumpAddress = 0;
+-    uint32_t jumpAddressOnTrue = 0;
+-    uint32_t jumpAddressOnFalse = 0;
+-
+-    bool afterInstruction = false;
+-};
+-
+-struct RecompilerConfig
+-{
+-    std::string directoryPath;
+-    std::string filePath;
+-    std::string patchFilePath;
+-    std::string patchedFilePath;
+-    std::string outDirectoryPath;
+-    std::string switchTableFilePath;
+-    std::unordered_map<uint32_t, RecompilerSwitchTable> switchTables;
+-    bool skipLr = false;
+-    bool ctrAsLocalVariable = false;
+-    bool xerAsLocalVariable = false;
+-    bool reservedRegisterAsLocalVariable = false;
+-    bool skipMsr = false;
+-    bool crRegistersAsLocalVariables = false;
+-    bool nonArgumentRegistersAsLocalVariables = false;
+-    bool nonVolatileRegistersAsLocalVariables = false;
+-    uint32_t restGpr14Address = 0;
+-    uint32_t saveGpr14Address = 0;
+-    uint32_t restFpr14Address = 0;
+-    uint32_t saveFpr14Address = 0;
+-    uint32_t restVmx14Address = 0;
+-    uint32_t saveVmx14Address = 0;
+-    uint32_t restVmx64Address = 0;
+-    uint32_t saveVmx64Address = 0;
+-    uint32_t longJmpAddress = 0;
+-    uint32_t setJmpAddress = 0;
+-    std::unordered_map<uint32_t, uint32_t> functions;
+-    std::unordered_map<uint32_t, uint32_t> invalidInstructions;
+-    std::unordered_map<uint32_t, RecompilerMidAsmHook> midAsmHooks;
+-
+-    void Load(const std::string_view& configFilePath);
+-};
++#pragma once
++
++struct RecompilerSwitchTable
++{
++    uint32_t r;
++    std::vector<uint32_t> labels;
++};
++
++struct RecompilerMidAsmHook
++{
++    std::string name;
++    std::vector<std::string> registers;
++
++    bool ret = false;
++    bool returnOnTrue = false;
++    bool returnOnFalse = false;
++
++    uint32_t jumpAddress = 0;
++    uint32_t jumpAddressOnTrue = 0;
++    uint32_t jumpAddressOnFalse = 0;
++
++    bool afterInstruction = false;
++};
++
++struct RecompilerConfig
++{
++    std::string directoryPath;
++    std::string filePath;
++    std::string patchFilePath;
++    std::string patchedFilePath;
++    std::string outDirectoryPath;
++    std::string switchTableFilePath;
++    std::unordered_map<uint32_t, RecompilerSwitchTable> switchTables;
++    bool skipLr = false;
++    bool ctrAsLocalVariable = false;
++    bool xerAsLocalVariable = false;
++    bool reservedRegisterAsLocalVariable = false;
++    bool skipMsr = false;
++    bool crRegistersAsLocalVariables = false;
++    bool nonArgumentRegistersAsLocalVariables = false;
++    bool nonVolatileRegistersAsLocalVariables = false;
++    uint32_t restGpr14Address = 0;
++    uint32_t saveGpr14Address = 0;
++    uint32_t restFpr14Address = 0;
++    uint32_t saveFpr14Address = 0;
++    uint32_t restVmx14Address = 0;
++    uint32_t saveVmx14Address = 0;
++    uint32_t restVmx64Address = 0;
++    uint32_t saveVmx64Address = 0;
++    uint32_t longJmpAddress = 0;
++    uint32_t setJmpAddress = 0;
++    // Torchlight Step 11: non_argument_as_local / non_volatile_as_local only for functions that are
++    // safe (see Recompiler::AnalyseLocalSafety); all others keep every register in ctx.
++    bool safeLocals = false;
++    uint32_t localUnwindAddress = 0;
++    uint32_t sehHandlerThunkAddress = 0;
++    std::unordered_map<uint32_t, uint32_t> functions;
++    std::unordered_map<uint32_t, uint32_t> invalidInstructions;
++    std::unordered_map<uint32_t, RecompilerMidAsmHook> midAsmHooks;
++
++    void Load(const std::string_view& configFilePath);
++};
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..801cc7f 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -1,703 +1,732 @@
+-#ifndef PPC_CONTEXT_H_INCLUDED
+-#define PPC_CONTEXT_H_INCLUDED
+-
+-#ifndef PPC_CONFIG_H_INCLUDED
+-#error "ppc_config.h must be included before ppc_context.h"
+-#endif
+-
+-#include <climits>
+-#include <cmath>
+-#include <csetjmp>
+-#include <cstdint>
+-#include <cstdlib>
+-#include <cstring>
+-
+-#include <x86/avx.h>
+-#include <x86/sse.h>
+-#include <x86/sse4.1.h>
+-
+-// SSE3 constants are missing from simde
+-#ifndef _MM_DENORMALS_ZERO_MASK
+-#define _MM_DENORMALS_ZERO_MASK 0x0040
+-#endif
+-
+-#define PPC_JOIN(x, y) x##y
+-#define PPC_XSTRINGIFY(x) #x
+-#define PPC_STRINGIFY(x) PPC_XSTRINGIFY(x)
+-#define PPC_FUNC(x) void x(PPCContext& __restrict ctx, uint8_t* base)
+-#define PPC_FUNC_IMPL(x) extern "C" PPC_FUNC(x)
+-#define PPC_EXTERN_FUNC(x) extern PPC_FUNC(x)
+-#define PPC_WEAK_FUNC(x) __attribute__((weak,noinline)) PPC_FUNC(x)
+-
+-#define PPC_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0x1F) == 0)
+-
+-#ifndef PPC_LOAD_U8
+-#define PPC_LOAD_U8(x) *(volatile uint8_t*)(base + (x))
+-#endif
+-
+-#ifndef PPC_LOAD_U16
+-#define PPC_LOAD_U16(x) __builtin_bswap16(*(volatile uint16_t*)(base + (x)))
+-#endif
+-
+-#ifndef PPC_LOAD_U32
+-#define PPC_LOAD_U32(x) __builtin_bswap32(*(volatile uint32_t*)(base + (x)))
+-#endif
+-
+-#ifndef PPC_LOAD_U64
+-#define PPC_LOAD_U64(x) __builtin_bswap64(*(volatile uint64_t*)(base + (x)))
+-#endif
+-
+-// TODO: Implement.
+-// These are currently unused. However, MMIO loads could possibly be handled statically with some profiling and a fallback.
+-// The fallback would be a runtime exception handler which will intercept reads from MMIO regions 
+-// and log the PC for compiling to static code later.
+-#ifndef PPC_MM_LOAD_U8
+-#define PPC_MM_LOAD_U8(x)  PPC_LOAD_U8 (x)
+-#endif
+-
+-#ifndef PPC_MM_LOAD_U16
+-#define PPC_MM_LOAD_U16(x) PPC_LOAD_U16(x)
+-#endif
+-
+-#ifndef PPC_MM_LOAD_U32
+-#define PPC_MM_LOAD_U32(x) PPC_LOAD_U32(x)
+-#endif
+-
+-#ifndef PPC_MM_LOAD_U64
+-#define PPC_MM_LOAD_U64(x) PPC_LOAD_U64(x)
+-#endif
+-
+-#ifndef PPC_STORE_U8
+-#define PPC_STORE_U8(x, y) *(volatile uint8_t*)(base + (x)) = (y)
+-#endif
+-
+-#ifndef PPC_STORE_U16
+-#define PPC_STORE_U16(x, y) *(volatile uint16_t*)(base + (x)) = __builtin_bswap16(y)
+-#endif
+-
+-#ifndef PPC_STORE_U32
+-#define PPC_STORE_U32(x, y) *(volatile uint32_t*)(base + (x)) = __builtin_bswap32(y)
+-#endif
+-
+-#ifndef PPC_STORE_U64
+-#define PPC_STORE_U64(x, y) *(volatile uint64_t*)(base + (x)) = __builtin_bswap64(y)
+-#endif
+-
+-// MMIO Store handling is completely reliant on being preeceded by eieio.
+-// TODO: Verify if that's always the case.
+-#ifndef PPC_MM_STORE_U8
+-#define PPC_MM_STORE_U8(x, y)   PPC_STORE_U8 (x, y)
+-#endif
+-
+-#ifndef PPC_MM_STORE_U16
+-#define PPC_MM_STORE_U16(x, y)  PPC_STORE_U16(x, y)
+-#endif
+-
+-#ifndef PPC_MM_STORE_U32
+-#define PPC_MM_STORE_U32(x, y)  PPC_STORE_U32(x, y)
+-#endif
+-
+-#ifndef PPC_MM_STORE_U64
+-#define PPC_MM_STORE_U64(x, y)  PPC_STORE_U64(x, y)
+-#endif
+-
+-#ifndef PPC_CALL_FUNC
+-#define PPC_CALL_FUNC(x) x(ctx, base)
+-#endif
+-
+-#define PPC_MEMORY_SIZE 0x100000000ull
+-
+-#define PPC_LOOKUP_FUNC(x, y) *(PPCFunc**)(x + PPC_IMAGE_BASE + PPC_IMAGE_SIZE + (uint64_t(uint32_t(y) - PPC_CODE_BASE) * 2))
+-
+-#ifndef PPC_CALL_INDIRECT_FUNC
+-#define PPC_CALL_INDIRECT_FUNC(x) (PPC_LOOKUP_FUNC(base, x))(ctx, base)
+-#endif
+-
+-typedef void PPCFunc(struct PPCContext& __restrict__ ctx, uint8_t* base);
+-
+-struct PPCFuncMapping
+-{
+-    size_t guest;
+-    PPCFunc* host;
+-};
+-
+-extern PPCFuncMapping PPCFuncMappings[];
+-
+-union PPCRegister
+-{
+-    int8_t s8;
+-    uint8_t u8;
+-    int16_t s16;
+-    uint16_t u16;
+-    int32_t s32;
+-    uint32_t u32;
+-    int64_t s64;
+-    uint64_t u64;
+-    float f32;
+-    double f64;
+-};
+-
+-struct PPCXERRegister
+-{
+-    uint8_t so;
+-    uint8_t ov;
+-    uint8_t ca;
+-};
+-
+-struct PPCCRRegister
+-{
+-    uint8_t lt;
+-    uint8_t gt;
+-    uint8_t eq;
+-    union
+-    {
+-        uint8_t so;
+-        uint8_t un;
+-    };
+-
+-    template<typename T>
+-    inline void compare(T left, T right, const PPCXERRegister& xer) noexcept
+-    {
+-        lt = left < right;
+-        gt = left > right;
+-        eq = left == right;
+-        so = xer.so;
+-    }
+-
+-    inline void compare(double left, double right) noexcept
+-    {
+-        un = __builtin_isnan(left) || __builtin_isnan(right);
+-        lt = !un && (left < right);
+-        gt = !un && (left > right);
+-        eq = !un && (left == right);
+-    }
+-
+-    inline void setFromMask(simde__m128 mask, int imm) noexcept
+-    {
+-        int m = simde_mm_movemask_ps(mask);
+-        lt = m == imm; // all equal
+-        gt = 0;
+-        eq = m == 0; // none equal
+-        so = 0;
+-    }
+-
+-    inline void setFromMask(simde__m128i mask, int imm) noexcept
+-    {
+-        int m = simde_mm_movemask_epi8(mask);
+-        lt = m == imm; // all equal
+-        gt = 0;
+-        eq = m == 0; // none equal
+-        so = 0;
+-    }
+-};
+-
+-union alignas(0x10) PPCVRegister
+-{
+-    int8_t s8[16];
+-    uint8_t u8[16];
+-    int16_t s16[8];
+-    uint16_t u16[8];
+-    int32_t s32[4];
+-    uint32_t u32[4];
+-    int64_t s64[2];
+-    uint64_t u64[2];
+-    float f32[4];
+-    double f64[2];
+-};
+-
+-#define PPC_ROUND_NEAREST 0x00
+-#define PPC_ROUND_TOWARD_ZERO 0x01
+-#define PPC_ROUND_UP 0x02
+-#define PPC_ROUND_DOWN 0x03
+-#define PPC_ROUND_MASK 0x03
+-
+-struct PPCFPSCRRegister
+-{
+-    uint32_t csr;
+-
+-    static constexpr size_t HostToGuest[] = { PPC_ROUND_NEAREST, PPC_ROUND_DOWN, PPC_ROUND_UP, PPC_ROUND_TOWARD_ZERO };
+-
+-    // simde does not handle denormal flags, so we need to implement per-arch.
+-#if defined(__x86_64__) || defined(_M_X64)
+-    static constexpr size_t RoundShift = 13;
+-    static constexpr size_t RoundMask = SIMDE_MM_ROUND_MASK;
+-    static constexpr size_t FlushMask = SIMDE_MM_FLUSH_ZERO_MASK | _MM_DENORMALS_ZERO_MASK;
+-    static constexpr size_t GuestToHost[] = { SIMDE_MM_ROUND_NEAREST, SIMDE_MM_ROUND_TOWARD_ZERO, SIMDE_MM_ROUND_UP, SIMDE_MM_ROUND_DOWN };
+-
+-    inline uint32_t getcsr() noexcept
+-    {
+-        return simde_mm_getcsr();
+-    }
+-
+-    inline void setcsr(uint32_t csr) noexcept
+-    {
+-        simde_mm_setcsr(csr);
+-    }
+-#elif defined(__aarch64__) || defined(_M_ARM64)
+-    // RMode
+-    static constexpr size_t RoundShift = 22;
+-    static constexpr size_t RoundMask = 3 << RoundShift;
+-    // FZ and FZ16
+-    static constexpr size_t FlushMask = (1 << 19) | (1 << 24);
+-    // Nearest, Zero, -Infinity, -Infinity
+-    static constexpr size_t GuestToHost[] = { 0 << RoundShift, 3 << RoundShift, 1 << RoundShift, 2 << RoundShift };
+-
+-    inline uint32_t getcsr() noexcept
+-    {
+-        uint64_t csr;
+-        __asm__ __volatile__("mrs %0, fpcr" : "=r"(csr));
+-        return csr;
+-    }
+-
+-    inline void setcsr(uint32_t csr) noexcept
+-    {
+-        __asm__ __volatile__("msr fpcr, %0" : : "r"(csr));
+-    }
+-#else
+-#   error "Missing implementation for FPSCR."
+-#endif
+-
+-    inline uint32_t loadFromHost() noexcept
+-    {
+-        csr = getcsr();
+-        return HostToGuest[(csr & RoundMask) >> RoundShift];
+-    }
+-        
+-    inline void storeFromGuest(uint32_t value) noexcept
+-    {
+-        csr &= ~RoundMask;
+-        csr |= GuestToHost[value & PPC_ROUND_MASK];
+-        setcsr(csr);
+-    }
+-
+-    inline void enableFlushModeUnconditional() noexcept
+-    {
+-        csr |= FlushMask;
+-        setcsr(csr);
+-    }
+-
+-    inline void disableFlushModeUnconditional() noexcept
+-    {
+-        csr &= ~FlushMask;
+-        setcsr(csr);
+-    }
+-
+-    inline void enableFlushMode() noexcept
+-    {
+-        if ((csr & FlushMask) != FlushMask) [[unlikely]]
+-        {
+-            csr |= FlushMask;
+-            setcsr(csr);
+-        }
+-    }
+-
+-    inline void disableFlushMode() noexcept
+-    {
+-        if ((csr & FlushMask) != 0) [[unlikely]]
+-        {
+-            csr &= ~FlushMask;
+-            setcsr(csr);
+-        }
+-    }
+-};
+-
+-struct alignas(0x40) PPCContext
+-{
+-    PPCRegister r3;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
+-    PPCRegister r0;
+-#endif
+-    PPCRegister r1;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
+-    PPCRegister r2;
+-#endif
+-    PPCRegister r4;
+-    PPCRegister r5;
+-    PPCRegister r6;
+-    PPCRegister r7;
+-    PPCRegister r8;
+-    PPCRegister r9;
+-    PPCRegister r10;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
+-    PPCRegister r11;
+-    PPCRegister r12;
+-#endif
+-    PPCRegister r13;
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+-    PPCRegister r14;
+-    PPCRegister r15;
+-    PPCRegister r16;
+-    PPCRegister r17;
+-    PPCRegister r18;
+-    PPCRegister r19;
+-    PPCRegister r20;
+-    PPCRegister r21;
+-    PPCRegister r22;
+-    PPCRegister r23;
+-    PPCRegister r24;
+-    PPCRegister r25;
+-    PPCRegister r26;
+-    PPCRegister r27;
+-    PPCRegister r28;
+-    PPCRegister r29;
+-    PPCRegister r30;
+-    PPCRegister r31;
+-#endif
+-
+-#ifndef PPC_CONFIG_SKIP_LR
+-    uint64_t lr;
+-#endif
+-#ifndef PPC_CONFIG_CTR_AS_LOCAL
+-    PPCRegister ctr;
+-#endif
+-#ifndef PPC_CONFIG_XER_AS_LOCAL
+-    PPCXERRegister xer;
+-#endif
+-#ifndef PPC_CONFIG_RESERVED_AS_LOCAL
+-    PPCRegister reserved;
+-#endif
+-#ifndef PPC_CONFIG_SKIP_MSR
+-    uint32_t msr = 0x200A000;
+-#endif
+-#ifndef PPC_CONFIG_CR_AS_LOCAL
+-    PPCCRRegister cr0;
+-    PPCCRRegister cr1;
+-    PPCCRRegister cr2;
+-    PPCCRRegister cr3;
+-    PPCCRRegister cr4;
+-    PPCCRRegister cr5;
+-    PPCCRRegister cr6;
+-    PPCCRRegister cr7;
+-#endif
+-    PPCFPSCRRegister fpscr;
+-
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
+-    PPCRegister f0;
+-#endif
+-    PPCRegister f1;
+-    PPCRegister f2;
+-    PPCRegister f3;
+-    PPCRegister f4;
+-    PPCRegister f5;
+-    PPCRegister f6;
+-    PPCRegister f7;
+-    PPCRegister f8;
+-    PPCRegister f9;
+-    PPCRegister f10;
+-    PPCRegister f11;
+-    PPCRegister f12;
+-    PPCRegister f13;
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+-    PPCRegister f14;
+-    PPCRegister f15;
+-    PPCRegister f16;
+-    PPCRegister f17;
+-    PPCRegister f18;
+-    PPCRegister f19;
+-    PPCRegister f20;
+-    PPCRegister f21;
+-    PPCRegister f22;
+-    PPCRegister f23;
+-    PPCRegister f24;
+-    PPCRegister f25;
+-    PPCRegister f26;
+-    PPCRegister f27;
+-    PPCRegister f28;
+-    PPCRegister f29;
+-    PPCRegister f30;
+-    PPCRegister f31;
+-#endif
+-
+-    PPCVRegister v0;
+-    PPCVRegister v1;
+-    PPCVRegister v2;
+-    PPCVRegister v3;
+-    PPCVRegister v4;
+-    PPCVRegister v5;
+-    PPCVRegister v6;
+-    PPCVRegister v7;
+-    PPCVRegister v8;
+-    PPCVRegister v9;
+-    PPCVRegister v10;
+-    PPCVRegister v11;
+-    PPCVRegister v12;
+-    PPCVRegister v13;
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+-    PPCVRegister v14;
+-    PPCVRegister v15;
+-    PPCVRegister v16;
+-    PPCVRegister v17;
+-    PPCVRegister v18;
+-    PPCVRegister v19;
+-    PPCVRegister v20;
+-    PPCVRegister v21;
+-    PPCVRegister v22;
+-    PPCVRegister v23;
+-    PPCVRegister v24;
+-    PPCVRegister v25;
+-    PPCVRegister v26;
+-    PPCVRegister v27;
+-    PPCVRegister v28;
+-    PPCVRegister v29;
+-    PPCVRegister v30;
+-    PPCVRegister v31;
+-#endif
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
+-    PPCVRegister v32;
+-    PPCVRegister v33;
+-    PPCVRegister v34;
+-    PPCVRegister v35;
+-    PPCVRegister v36;
+-    PPCVRegister v37;
+-    PPCVRegister v38;
+-    PPCVRegister v39;
+-    PPCVRegister v40;
+-    PPCVRegister v41;
+-    PPCVRegister v42;
+-    PPCVRegister v43;
+-    PPCVRegister v44;
+-    PPCVRegister v45;
+-    PPCVRegister v46;
+-    PPCVRegister v47;
+-    PPCVRegister v48;
+-    PPCVRegister v49;
+-    PPCVRegister v50;
+-    PPCVRegister v51;
+-    PPCVRegister v52;
+-    PPCVRegister v53;
+-    PPCVRegister v54;
+-    PPCVRegister v55;
+-    PPCVRegister v56;
+-    PPCVRegister v57;
+-    PPCVRegister v58;
+-    PPCVRegister v59;
+-    PPCVRegister v60;
+-    PPCVRegister v61;
+-    PPCVRegister v62;
+-    PPCVRegister v63;
+-#endif
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+-    PPCVRegister v64;
+-    PPCVRegister v65;
+-    PPCVRegister v66;
+-    PPCVRegister v67;
+-    PPCVRegister v68;
+-    PPCVRegister v69;
+-    PPCVRegister v70;
+-    PPCVRegister v71;
+-    PPCVRegister v72;
+-    PPCVRegister v73;
+-    PPCVRegister v74;
+-    PPCVRegister v75;
+-    PPCVRegister v76;
+-    PPCVRegister v77;
+-    PPCVRegister v78;
+-    PPCVRegister v79;
+-    PPCVRegister v80;
+-    PPCVRegister v81;
+-    PPCVRegister v82;
+-    PPCVRegister v83;
+-    PPCVRegister v84;
+-    PPCVRegister v85;
+-    PPCVRegister v86;
+-    PPCVRegister v87;
+-    PPCVRegister v88;
+-    PPCVRegister v89;
+-    PPCVRegister v90;
+-    PPCVRegister v91;
+-    PPCVRegister v92;
+-    PPCVRegister v93;
+-    PPCVRegister v94;
+-    PPCVRegister v95;
+-    PPCVRegister v96;
+-    PPCVRegister v97;
+-    PPCVRegister v98;
+-    PPCVRegister v99;
+-    PPCVRegister v100;
+-    PPCVRegister v101;
+-    PPCVRegister v102;
+-    PPCVRegister v103;
+-    PPCVRegister v104;
+-    PPCVRegister v105;
+-    PPCVRegister v106;
+-    PPCVRegister v107;
+-    PPCVRegister v108;
+-    PPCVRegister v109;
+-    PPCVRegister v110;
+-    PPCVRegister v111;
+-    PPCVRegister v112;
+-    PPCVRegister v113;
+-    PPCVRegister v114;
+-    PPCVRegister v115;
+-    PPCVRegister v116;
+-    PPCVRegister v117;
+-    PPCVRegister v118;
+-    PPCVRegister v119;
+-    PPCVRegister v120;
+-    PPCVRegister v121;
+-    PPCVRegister v122;
+-    PPCVRegister v123;
+-    PPCVRegister v124;
+-    PPCVRegister v125;
+-    PPCVRegister v126;
+-    PPCVRegister v127;
+-#endif
+-};
+-
+-inline uint8_t VectorMaskL[] =
+-{
+-    0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
+-    0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+-    0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
+-    0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E,
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+-};
+-
+-inline uint8_t VectorMaskR[] =
+-{
+-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+-    0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF,
+-    0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF,
+-    0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF,
+-};
+-
+-inline uint8_t VectorShiftTableL[] =
+-{
+-    0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
+-    0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+-    0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
+-    0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
+-    0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04,
+-    0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05,
+-    0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06,
+-    0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07,
+-    0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
+-    0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09,
+-    0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,
+-    0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B,
+-    0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C,
+-    0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D,
+-    0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E,
+-    0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F,
+-};
+-
+-inline uint8_t VectorShiftTableR[] =
+-{
+-    0x1F, 0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10,
+-    0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F,
+-    0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E,
+-    0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D,
+-    0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C,
+-    0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B,
+-    0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,
+-    0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09,
+-    0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
+-    0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07,
+-    0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06,
+-    0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05,
+-    0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04,
+-    0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
+-    0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
+-    0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+-};
+-
+-inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b)
+-{
+-    return simde_mm_add_epi32(a, simde_mm_min_epu32(simde_mm_xor_si128(a, simde_mm_cmpeq_epi32(a, a)), b));
+-}
+-
+-inline simde__m128i simde_mm_avg_epi8(simde__m128i a, simde__m128i b)
+-{
+-    simde__m128i c = simde_mm_set1_epi8(char(128));
+-    return simde_mm_xor_si128(c, simde_mm_avg_epu8(simde_mm_xor_si128(c, a), simde_mm_xor_si128(c, b)));
+-}
+-
+-inline simde__m128i simde_mm_avg_epi16(simde__m128i a, simde__m128i b)
+-{
+-    simde__m128i c = simde_mm_set1_epi16(short(32768));
+-    return simde_mm_xor_si128(c, simde_mm_avg_epu16(simde_mm_xor_si128(c, a), simde_mm_xor_si128(c, b)));
+-}
+-
+-inline simde__m128 simde_mm_cvtepu32_ps_(simde__m128i src1)
+-{
+-    simde__m128i xmm1 = simde_mm_add_epi32(src1, simde_mm_set1_epi32(127));
+-    simde__m128i xmm0 = simde_mm_slli_epi32(src1, 31 - 8);
+-    xmm0 = simde_mm_srli_epi32(xmm0, 31);
+-    xmm0 = simde_mm_add_epi32(xmm0, xmm1);
+-    xmm0 = simde_mm_srai_epi32(xmm0, 8);
+-    xmm0 = simde_mm_add_epi32(xmm0, simde_mm_set1_epi32(0x4F800000));
+-    simde__m128 xmm2 = simde_mm_cvtepi32_ps(src1);
+-    return simde_mm_blendv_ps(xmm2, simde_mm_castsi128_ps(xmm0), simde_mm_castsi128_ps(src1));
+-}
+-
+-inline simde__m128i simde_mm_perm_epi8_(simde__m128i a, simde__m128i b, simde__m128i c)
+-{
+-    simde__m128i d = simde_mm_set1_epi8(0xF);
+-    simde__m128i e = simde_mm_sub_epi8(d, simde_mm_and_si128(c, d));
+-    return simde_mm_blendv_epi8(simde_mm_shuffle_epi8(a, e), simde_mm_shuffle_epi8(b, e), simde_mm_slli_epi32(c, 3));
+-}
+-
+-inline simde__m128i simde_mm_cmpgt_epu8(simde__m128i a, simde__m128i b)
+-{
+-    simde__m128i c = simde_mm_set1_epi8(char(128));
+-    return simde_mm_cmpgt_epi8(simde_mm_xor_si128(a, c), simde_mm_xor_si128(b, c));
+-}
+-
+-inline simde__m128i simde_mm_cmpgt_epu16(simde__m128i a, simde__m128i b)
+-{
+-    simde__m128i c = simde_mm_set1_epi16(short(32768));
+-    return simde_mm_cmpgt_epi16(simde_mm_xor_si128(a, c), simde_mm_xor_si128(b, c));
+-}
+-
+-inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
+-{
+-    simde__m128 xmm2 = simde_mm_cmpunord_ps(src1, src1);
+-    simde__m128i xmm0 = simde_mm_cvttps_epi32(src1);
+-    simde__m128i xmm1 = simde_mm_cmpeq_epi32(xmm0, simde_mm_set1_epi32(INT_MIN));
+-    xmm1 = simde_mm_andnot_si128(simde_mm_castps_si128(src1), xmm1);
+-    simde__m128 dest = simde_mm_blendv_ps(simde_mm_castsi128_ps(xmm0), simde_mm_castsi128_ps(simde_mm_set1_epi32(INT_MAX)), simde_mm_castsi128_ps(xmm1));
+-    return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
+-}
+-
+-inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
+-{
+-    b = simde_mm_srli_epi64(simde_mm_slli_epi64(b, 61), 61);
+-    return simde_mm_castps_si128(simde_mm_insert_ps(simde_mm_castsi128_ps(simde_mm_srl_epi64(a, b)), simde_mm_castsi128_ps(simde_mm_srl_epi64(simde_mm_srli_si128(a, 4), b)), 0x10));
+-}
+-
+-#if defined(__aarch64__) || defined(_M_ARM64)
+-inline uint64_t __rdtsc()
+-{
+-    uint64_t ret;
+-    asm volatile("mrs %0, cntvct_el0\n\t"
+-                 : "=r"(ret)::"memory");
+-    return ret;
+-}
+-#elif !defined(__x86_64__) && !defined(_M_X64)
+-#   error "Missing implementation for __rdtsc()"
+-#endif
+-
+-#endif
++#ifndef PPC_CONTEXT_H_INCLUDED
++#define PPC_CONTEXT_H_INCLUDED
++
++#ifndef PPC_CONFIG_H_INCLUDED
++#error "ppc_config.h must be included before ppc_context.h"
++#endif
++
++#include <climits>
++#include <cmath>
++#include <csetjmp>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++#include <x86/avx.h>
++#include <x86/sse.h>
++#include <x86/sse4.1.h>
++
++// SSE3 constants are missing from simde
++#ifndef _MM_DENORMALS_ZERO_MASK
++#define _MM_DENORMALS_ZERO_MASK 0x0040
++#endif
++
++#define PPC_JOIN(x, y) x##y
++#define PPC_XSTRINGIFY(x) #x
++#define PPC_STRINGIFY(x) PPC_XSTRINGIFY(x)
++#define PPC_FUNC(x) void x(PPCContext& __restrict ctx, uint8_t* base)
++#define PPC_FUNC_IMPL(x) extern "C" PPC_FUNC(x)
++#define PPC_EXTERN_FUNC(x) extern PPC_FUNC(x)
++#define PPC_WEAK_FUNC(x) __attribute__((weak,noinline)) PPC_FUNC(x)
++
++#define PPC_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0x1F) == 0)
++
++// Torchlight: guest setjmp/longjmp. The host buffer is stored at the start of the guest jmp_buf
++// (> 1 KB). Windows x64: our own non-unwinding setjmp/longjmp (runtime cpu/host_setjmp.cpp) -
++// the CRT longjmp unwinds host frames (crashed) and clang's __builtin_setjmp restores a wrong
++// rbp on Win64. Elsewhere libc _setjmp/_longjmp. The caller restores the guest registers from
++// its saved PPCContext copy.
++#ifndef PPC_SETJMP
++extern "C" [[noreturn]] void PPCHostLongJmp(void* buf, int value);
++#if defined(_WIN32) && defined(__x86_64__)
++extern "C" __attribute__((returns_twice)) int PPCHostSetJmp(void* buf);
++#define PPC_SETJMP(buf) PPCHostSetJmp(buf)
++#else
++#define PPC_SETJMP(buf) _setjmp(*reinterpret_cast<jmp_buf*>(buf))
++#endif
++#define PPC_LONGJMP(buf, val) PPCHostLongJmp(buf, val)
++#endif
++
++#ifndef PPC_LOAD_U8
++#define PPC_LOAD_U8(x) *(volatile uint8_t*)(base + (x))
++#endif
++
++#ifndef PPC_LOAD_U16
++#define PPC_LOAD_U16(x) __builtin_bswap16(*(volatile uint16_t*)(base + (x)))
++#endif
++
++// FSRecomp Step 37: the PowerPC memory barriers. x86 keeps loads and stores in order on its own (they stay empty
++// there, as before); ARM does not, so the game's lock-free code (job queues, locks released with lwsync + stw) needs
++// real barriers: sync = full, lwsync = everything but store-then-load (dmb ish), eieio = store-store (dmb ishst).
++#if defined(__aarch64__) || defined(_M_ARM64)
++#define PPC_FENCE_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
++#define PPC_FENCE_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
++#define PPC_FENCE_EIEIO() __asm__ __volatile__("dmb ishst" ::: "memory")
++#else
++#define PPC_FENCE_SYNC()
++#define PPC_FENCE_LWSYNC()
++#define PPC_FENCE_EIEIO()
++#endif
++
++#ifndef PPC_LOAD_U32
++#define PPC_LOAD_U32(x) __builtin_bswap32(*(volatile uint32_t*)(base + (x)))
++#endif
++
++#ifndef PPC_LOAD_U64
++#define PPC_LOAD_U64(x) __builtin_bswap64(*(volatile uint64_t*)(base + (x)))
++#endif
++
++// TODO: Implement.
++// These are currently unused. However, MMIO loads could possibly be handled statically with some profiling and a fallback.
++// The fallback would be a runtime exception handler which will intercept reads from MMIO regions 
++// and log the PC for compiling to static code later.
++#ifndef PPC_MM_LOAD_U8
++#define PPC_MM_LOAD_U8(x)  PPC_LOAD_U8 (x)
++#endif
++
++#ifndef PPC_MM_LOAD_U16
++#define PPC_MM_LOAD_U16(x) PPC_LOAD_U16(x)
++#endif
++
++#ifndef PPC_MM_LOAD_U32
++#define PPC_MM_LOAD_U32(x) PPC_LOAD_U32(x)
++#endif
++
++#ifndef PPC_MM_LOAD_U64
++#define PPC_MM_LOAD_U64(x) PPC_LOAD_U64(x)
++#endif
++
++#ifndef PPC_STORE_U8
++#define PPC_STORE_U8(x, y) *(volatile uint8_t*)(base + (x)) = (y)
++#endif
++
++#ifndef PPC_STORE_U16
++#define PPC_STORE_U16(x, y) *(volatile uint16_t*)(base + (x)) = __builtin_bswap16(y)
++#endif
++
++#ifndef PPC_STORE_U32
++#define PPC_STORE_U32(x, y) *(volatile uint32_t*)(base + (x)) = __builtin_bswap32(y)
++#endif
++
++#ifndef PPC_STORE_U64
++#define PPC_STORE_U64(x, y) *(volatile uint64_t*)(base + (x)) = __builtin_bswap64(y)
++#endif
++
++// MMIO Store handling is completely reliant on being preeceded by eieio.
++// TODO: Verify if that's always the case.
++#ifndef PPC_MM_STORE_U8
++#define PPC_MM_STORE_U8(x, y)   PPC_STORE_U8 (x, y)
++#endif
++
++#ifndef PPC_MM_STORE_U16
++#define PPC_MM_STORE_U16(x, y)  PPC_STORE_U16(x, y)
++#endif
++
++#ifndef PPC_MM_STORE_U32
++#define PPC_MM_STORE_U32(x, y)  PPC_STORE_U32(x, y)
++#endif
++
++#ifndef PPC_MM_STORE_U64
++#define PPC_MM_STORE_U64(x, y)  PPC_STORE_U64(x, y)
++#endif
++
++#ifndef PPC_CALL_FUNC
++#define PPC_CALL_FUNC(x) x(ctx, base)
++#endif
++
++#define PPC_MEMORY_SIZE 0x100000000ull
++
++#define PPC_LOOKUP_FUNC(x, y) *(PPCFunc**)(x + PPC_IMAGE_BASE + PPC_IMAGE_SIZE + (uint64_t(uint32_t(y) - PPC_CODE_BASE) * 2))
++
++#ifndef PPC_CALL_INDIRECT_FUNC
++#define PPC_CALL_INDIRECT_FUNC(x) (PPC_LOOKUP_FUNC(base, x))(ctx, base)
++#endif
++
++typedef void PPCFunc(struct PPCContext& __restrict__ ctx, uint8_t* base);
++
++struct PPCFuncMapping
++{
++    size_t guest;
++    PPCFunc* host;
++};
++
++extern PPCFuncMapping PPCFuncMappings[];
++
++union PPCRegister
++{
++    int8_t s8;
++    uint8_t u8;
++    int16_t s16;
++    uint16_t u16;
++    int32_t s32;
++    uint32_t u32;
++    int64_t s64;
++    uint64_t u64;
++    float f32;
++    double f64;
++};
++
++struct PPCXERRegister
++{
++    uint8_t so;
++    uint8_t ov;
++    uint8_t ca;
++};
++
++struct PPCCRRegister
++{
++    uint8_t lt;
++    uint8_t gt;
++    uint8_t eq;
++    union
++    {
++        uint8_t so;
++        uint8_t un;
++    };
++
++    template<typename T>
++    inline void compare(T left, T right, const PPCXERRegister& xer) noexcept
++    {
++        lt = left < right;
++        gt = left > right;
++        eq = left == right;
++        so = xer.so;
++    }
++
++    inline void compare(double left, double right) noexcept
++    {
++        un = __builtin_isnan(left) || __builtin_isnan(right);
++        lt = !un && (left < right);
++        gt = !un && (left > right);
++        eq = !un && (left == right);
++    }
++
++    inline void setFromMask(simde__m128 mask, int imm) noexcept
++    {
++        int m = simde_mm_movemask_ps(mask);
++        lt = m == imm; // all equal
++        gt = 0;
++        eq = m == 0; // none equal
++        so = 0;
++    }
++
++    inline void setFromMask(simde__m128i mask, int imm) noexcept
++    {
++        int m = simde_mm_movemask_epi8(mask);
++        lt = m == imm; // all equal
++        gt = 0;
++        eq = m == 0; // none equal
++        so = 0;
++    }
++};
++
++union alignas(0x10) PPCVRegister
++{
++    int8_t s8[16];
++    uint8_t u8[16];
++    int16_t s16[8];
++    uint16_t u16[8];
++    int32_t s32[4];
++    uint32_t u32[4];
++    int64_t s64[2];
++    uint64_t u64[2];
++    float f32[4];
++    double f64[2];
++};
++
++#define PPC_ROUND_NEAREST 0x00
++#define PPC_ROUND_TOWARD_ZERO 0x01
++#define PPC_ROUND_UP 0x02
++#define PPC_ROUND_DOWN 0x03
++#define PPC_ROUND_MASK 0x03
++
++struct PPCFPSCRRegister
++{
++    uint32_t csr;
++
++    static constexpr size_t HostToGuest[] = { PPC_ROUND_NEAREST, PPC_ROUND_DOWN, PPC_ROUND_UP, PPC_ROUND_TOWARD_ZERO };
++
++    // simde does not handle denormal flags, so we need to implement per-arch.
++#if defined(__x86_64__) || defined(_M_X64)
++    static constexpr size_t RoundShift = 13;
++    static constexpr size_t RoundMask = SIMDE_MM_ROUND_MASK;
++    static constexpr size_t FlushMask = SIMDE_MM_FLUSH_ZERO_MASK | _MM_DENORMALS_ZERO_MASK;
++    static constexpr size_t GuestToHost[] = { SIMDE_MM_ROUND_NEAREST, SIMDE_MM_ROUND_TOWARD_ZERO, SIMDE_MM_ROUND_UP, SIMDE_MM_ROUND_DOWN };
++
++    inline uint32_t getcsr() noexcept
++    {
++        return simde_mm_getcsr();
++    }
++
++    inline void setcsr(uint32_t csr) noexcept
++    {
++        simde_mm_setcsr(csr);
++    }
++#elif defined(__aarch64__) || defined(_M_ARM64)
++    // RMode
++    static constexpr size_t RoundShift = 22;
++    static constexpr size_t RoundMask = 3 << RoundShift;
++    // FZ and FZ16
++    static constexpr size_t FlushMask = (1 << 19) | (1 << 24);
++    // Nearest, Zero, -Infinity, -Infinity
++    static constexpr size_t GuestToHost[] = { 0 << RoundShift, 3 << RoundShift, 1 << RoundShift, 2 << RoundShift };
++
++    inline uint32_t getcsr() noexcept
++    {
++        uint64_t csr;
++        __asm__ __volatile__("mrs %0, fpcr" : "=r"(csr));
++        return csr;
++    }
++
++    inline void setcsr(uint32_t csr) noexcept
++    {
++        __asm__ __volatile__("msr fpcr, %0" : : "r"(csr));
++    }
++#else
++#   error "Missing implementation for FPSCR."
++#endif
++
++    inline uint32_t loadFromHost() noexcept
++    {
++        csr = getcsr();
++        return HostToGuest[(csr & RoundMask) >> RoundShift];
++    }
++        
++    inline void storeFromGuest(uint32_t value) noexcept
++    {
++        csr &= ~RoundMask;
++        csr |= GuestToHost[value & PPC_ROUND_MASK];
++        setcsr(csr);
++    }
++
++    inline void enableFlushModeUnconditional() noexcept
++    {
++        csr |= FlushMask;
++        setcsr(csr);
++    }
++
++    inline void disableFlushModeUnconditional() noexcept
++    {
++        csr &= ~FlushMask;
++        setcsr(csr);
++    }
++
++    inline void enableFlushMode() noexcept
++    {
++        if ((csr & FlushMask) != FlushMask) [[unlikely]]
++        {
++            csr |= FlushMask;
++            setcsr(csr);
++        }
++    }
++
++    inline void disableFlushMode() noexcept
++    {
++        if ((csr & FlushMask) != 0) [[unlikely]]
++        {
++            csr &= ~FlushMask;
++            setcsr(csr);
++        }
++    }
++};
++
++struct alignas(0x40) PPCContext
++{
++    PPCRegister r3;
++#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++    PPCRegister r0;
++#endif
++    PPCRegister r1;
++#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++    PPCRegister r2;
++#endif
++    PPCRegister r4;
++    PPCRegister r5;
++    PPCRegister r6;
++    PPCRegister r7;
++    PPCRegister r8;
++    PPCRegister r9;
++    PPCRegister r10;
++#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++    PPCRegister r11;
++    PPCRegister r12;
++#endif
++    PPCRegister r13;
++#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++    PPCRegister r14;
++    PPCRegister r15;
++    PPCRegister r16;
++    PPCRegister r17;
++    PPCRegister r18;
++    PPCRegister r19;
++    PPCRegister r20;
++    PPCRegister r21;
++    PPCRegister r22;
++    PPCRegister r23;
++    PPCRegister r24;
++    PPCRegister r25;
++    PPCRegister r26;
++    PPCRegister r27;
++    PPCRegister r28;
++    PPCRegister r29;
++    PPCRegister r30;
++    PPCRegister r31;
++#endif
++
++#ifndef PPC_CONFIG_SKIP_LR
++    uint64_t lr;
++#endif
++#ifndef PPC_CONFIG_CTR_AS_LOCAL
++    PPCRegister ctr;
++#endif
++#ifndef PPC_CONFIG_XER_AS_LOCAL
++    PPCXERRegister xer;
++#endif
++#ifndef PPC_CONFIG_RESERVED_AS_LOCAL
++    PPCRegister reserved;
++#endif
++#ifndef PPC_CONFIG_SKIP_MSR
++    uint32_t msr = 0x200A000;
++#endif
++#ifndef PPC_CONFIG_CR_AS_LOCAL
++    PPCCRRegister cr0;
++    PPCCRRegister cr1;
++    PPCCRRegister cr2;
++    PPCCRRegister cr3;
++    PPCCRRegister cr4;
++    PPCCRRegister cr5;
++    PPCCRRegister cr6;
++    PPCCRRegister cr7;
++#endif
++    PPCFPSCRRegister fpscr;
++
++#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++    PPCRegister f0;
++#endif
++    PPCRegister f1;
++    PPCRegister f2;
++    PPCRegister f3;
++    PPCRegister f4;
++    PPCRegister f5;
++    PPCRegister f6;
++    PPCRegister f7;
++    PPCRegister f8;
++    PPCRegister f9;
++    PPCRegister f10;
++    PPCRegister f11;
++    PPCRegister f12;
++    PPCRegister f13;
++#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++    PPCRegister f14;
++    PPCRegister f15;
++    PPCRegister f16;
++    PPCRegister f17;
++    PPCRegister f18;
++    PPCRegister f19;
++    PPCRegister f20;
++    PPCRegister f21;
++    PPCRegister f22;
++    PPCRegister f23;
++    PPCRegister f24;
++    PPCRegister f25;
++    PPCRegister f26;
++    PPCRegister f27;
++    PPCRegister f28;
++    PPCRegister f29;
++    PPCRegister f30;
++    PPCRegister f31;
++#endif
++
++    PPCVRegister v0;
++    PPCVRegister v1;
++    PPCVRegister v2;
++    PPCVRegister v3;
++    PPCVRegister v4;
++    PPCVRegister v5;
++    PPCVRegister v6;
++    PPCVRegister v7;
++    PPCVRegister v8;
++    PPCVRegister v9;
++    PPCVRegister v10;
++    PPCVRegister v11;
++    PPCVRegister v12;
++    PPCVRegister v13;
++#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++    PPCVRegister v14;
++    PPCVRegister v15;
++    PPCVRegister v16;
++    PPCVRegister v17;
++    PPCVRegister v18;
++    PPCVRegister v19;
++    PPCVRegister v20;
++    PPCVRegister v21;
++    PPCVRegister v22;
++    PPCVRegister v23;
++    PPCVRegister v24;
++    PPCVRegister v25;
++    PPCVRegister v26;
++    PPCVRegister v27;
++    PPCVRegister v28;
++    PPCVRegister v29;
++    PPCVRegister v30;
++    PPCVRegister v31;
++#endif
++#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++    PPCVRegister v32;
++    PPCVRegister v33;
++    PPCVRegister v34;
++    PPCVRegister v35;
++    PPCVRegister v36;
++    PPCVRegister v37;
++    PPCVRegister v38;
++    PPCVRegister v39;
++    PPCVRegister v40;
++    PPCVRegister v41;
++    PPCVRegister v42;
++    PPCVRegister v43;
++    PPCVRegister v44;
++    PPCVRegister v45;
++    PPCVRegister v46;
++    PPCVRegister v47;
++    PPCVRegister v48;
++    PPCVRegister v49;
++    PPCVRegister v50;
++    PPCVRegister v51;
++    PPCVRegister v52;
++    PPCVRegister v53;
++    PPCVRegister v54;
++    PPCVRegister v55;
++    PPCVRegister v56;
++    PPCVRegister v57;
++    PPCVRegister v58;
++    PPCVRegister v59;
++    PPCVRegister v60;
++    PPCVRegister v61;
++    PPCVRegister v62;
++    PPCVRegister v63;
++#endif
++#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++    PPCVRegister v64;
++    PPCVRegister v65;
++    PPCVRegister v66;
++    PPCVRegister v67;
++    PPCVRegister v68;
++    PPCVRegister v69;
++    PPCVRegister v70;
++    PPCVRegister v71;
++    PPCVRegister v72;
++    PPCVRegister v73;
++    PPCVRegister v74;
++    PPCVRegister v75;
++    PPCVRegister v76;
++    PPCVRegister v77;
++    PPCVRegister v78;
++    PPCVRegister v79;
++    PPCVRegister v80;
++    PPCVRegister v81;
++    PPCVRegister v82;
++    PPCVRegister v83;
++    PPCVRegister v84;
++    PPCVRegister v85;
++    PPCVRegister v86;
++    PPCVRegister v87;
++    PPCVRegister v88;
++    PPCVRegister v89;
++    PPCVRegister v90;
++    PPCVRegister v91;
++    PPCVRegister v92;
++    PPCVRegister v93;
++    PPCVRegister v94;
++    PPCVRegister v95;
++    PPCVRegister v96;
++    PPCVRegister v97;
++    PPCVRegister v98;
++    PPCVRegister v99;
++    PPCVRegister v100;
++    PPCVRegister v101;
++    PPCVRegister v102;
++    PPCVRegister v103;
++    PPCVRegister v104;
++    PPCVRegister v105;
++    PPCVRegister v106;
++    PPCVRegister v107;
++    PPCVRegister v108;
++    PPCVRegister v109;
++    PPCVRegister v110;
++    PPCVRegister v111;
++    PPCVRegister v112;
++    PPCVRegister v113;
++    PPCVRegister v114;
++    PPCVRegister v115;
++    PPCVRegister v116;
++    PPCVRegister v117;
++    PPCVRegister v118;
++    PPCVRegister v119;
++    PPCVRegister v120;
++    PPCVRegister v121;
++    PPCVRegister v122;
++    PPCVRegister v123;
++    PPCVRegister v124;
++    PPCVRegister v125;
++    PPCVRegister v126;
++    PPCVRegister v127;
++#endif
++};
++
++inline uint8_t VectorMaskL[] =
++{
++    0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
++    0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
++    0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
++    0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
++    0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
++};
++
++inline uint8_t VectorMaskR[] =
++{
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF,
++    0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF,
++    0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF,
++};
++
++inline uint8_t VectorShiftTableL[] =
++{
++    0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
++    0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
++    0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
++    0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
++    0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04,
++    0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05,
++    0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06,
++    0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07,
++    0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
++    0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09,
++    0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,
++    0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B,
++    0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C,
++    0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D,
++    0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E,
++    0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F,
++};
++
++inline uint8_t VectorShiftTableR[] =
++{
++    0x1F, 0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10,
++    0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F,
++    0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E,
++    0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D,
++    0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C,
++    0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B,
++    0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,
++    0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09,
++    0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
++    0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07,
++    0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06,
++    0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05,
++    0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04,
++    0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
++    0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
++    0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
++};
++
++inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b)
++{
++    return simde_mm_add_epi32(a, simde_mm_min_epu32(simde_mm_xor_si128(a, simde_mm_cmpeq_epi32(a, a)), b));
++}
++
++inline simde__m128i simde_mm_avg_epi8(simde__m128i a, simde__m128i b)
++{
++    simde__m128i c = simde_mm_set1_epi8(char(128));
++    return simde_mm_xor_si128(c, simde_mm_avg_epu8(simde_mm_xor_si128(c, a), simde_mm_xor_si128(c, b)));
++}
++
++inline simde__m128i simde_mm_avg_epi16(simde__m128i a, simde__m128i b)
++{
++    simde__m128i c = simde_mm_set1_epi16(short(32768));
++    return simde_mm_xor_si128(c, simde_mm_avg_epu16(simde_mm_xor_si128(c, a), simde_mm_xor_si128(c, b)));
++}
++
++inline simde__m128 simde_mm_cvtepu32_ps_(simde__m128i src1)
++{
++    simde__m128i xmm1 = simde_mm_add_epi32(src1, simde_mm_set1_epi32(127));
++    simde__m128i xmm0 = simde_mm_slli_epi32(src1, 31 - 8);
++    xmm0 = simde_mm_srli_epi32(xmm0, 31);
++    xmm0 = simde_mm_add_epi32(xmm0, xmm1);
++    xmm0 = simde_mm_srai_epi32(xmm0, 8);
++    xmm0 = simde_mm_add_epi32(xmm0, simde_mm_set1_epi32(0x4F800000));
++    simde__m128 xmm2 = simde_mm_cvtepi32_ps(src1);
++    return simde_mm_blendv_ps(xmm2, simde_mm_castsi128_ps(xmm0), simde_mm_castsi128_ps(src1));
++}
++
++inline simde__m128i simde_mm_perm_epi8_(simde__m128i a, simde__m128i b, simde__m128i c)
++{
++    simde__m128i d = simde_mm_set1_epi8(0xF);
++    simde__m128i e = simde_mm_sub_epi8(d, simde_mm_and_si128(c, d));
++    return simde_mm_blendv_epi8(simde_mm_shuffle_epi8(a, e), simde_mm_shuffle_epi8(b, e), simde_mm_slli_epi32(c, 3));
++}
++
++inline simde__m128i simde_mm_cmpgt_epu8(simde__m128i a, simde__m128i b)
++{
++    simde__m128i c = simde_mm_set1_epi8(char(128));
++    return simde_mm_cmpgt_epi8(simde_mm_xor_si128(a, c), simde_mm_xor_si128(b, c));
++}
++
++inline simde__m128i simde_mm_cmpgt_epu16(simde__m128i a, simde__m128i b)
++{
++    simde__m128i c = simde_mm_set1_epi16(short(32768));
++    return simde_mm_cmpgt_epi16(simde_mm_xor_si128(a, c), simde_mm_xor_si128(b, c));
++}
++
++inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
++{
++    simde__m128 xmm2 = simde_mm_cmpunord_ps(src1, src1);
++    simde__m128i xmm0 = simde_mm_cvttps_epi32(src1);
++    simde__m128i xmm1 = simde_mm_cmpeq_epi32(xmm0, simde_mm_set1_epi32(INT_MIN));
++    xmm1 = simde_mm_andnot_si128(simde_mm_castps_si128(src1), xmm1);
++    simde__m128 dest = simde_mm_blendv_ps(simde_mm_castsi128_ps(xmm0), simde_mm_castsi128_ps(simde_mm_set1_epi32(INT_MAX)), simde_mm_castsi128_ps(xmm1));
++    return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
++}
++
++inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
++{
++    b = simde_mm_srli_epi64(simde_mm_slli_epi64(b, 61), 61);
++    return simde_mm_castps_si128(simde_mm_insert_ps(simde_mm_castsi128_ps(simde_mm_srl_epi64(a, b)), simde_mm_castsi128_ps(simde_mm_srl_epi64(simde_mm_srli_si128(a, 4), b)), 0x10));
++}
++
++#if defined(__aarch64__) || defined(_M_ARM64)
++inline uint64_t __rdtsc()
++{
++    uint64_t ret;
++    asm volatile("mrs %0, cntvct_el0\n\t"
++                 : "=r"(ret)::"memory");
++    return ret;
++}
++#elif !defined(__x86_64__) && !defined(_M_X64)
++#   error "Missing implementation for __rdtsc()"
++#endif
++
++#endif

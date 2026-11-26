@@ -401,6 +401,52 @@ uint32_t XexGetProcedureAddress(uint32_t module, uint32_t ordinal, be<uint32_t>*
     return 0xC0000225; // STATUS_NOT_FOUND
 }
 
+bool XexWriteTitleImage(const std::filesystem::path& out)
+{
+    if (g_xex.headerGuest == 0)
+        return false;
+    const uint8_t* header = static_cast<const uint8_t*>(g_memory.Translate(g_xex.headerGuest));
+    auto* info = reinterpret_cast<const be<uint32_t>*>(getOptHeaderPtr(header, XEX_HEADER_RESOURCE_INFO));
+    if (info == nullptr)
+        return false;
+    const uint32_t count = (uint32_t(info[0]) - 4) / 16;
+    char want[9];
+    snprintf(want, sizeof(want), "%08X", g_xex.titleId);
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const uint8_t* entry = reinterpret_cast<const uint8_t*>(info) + 4 + i * 16;
+        const std::string name(reinterpret_cast<const char*>(entry), strnlen(reinterpret_cast<const char*>(entry), 8));
+        const uint32_t address = uint32_t(*reinterpret_cast<const be<uint32_t>*>(entry + 8));
+        const uint32_t size = uint32_t(*reinterpret_cast<const be<uint32_t>*>(entry + 12));
+        std::string upper = name;
+        for (auto& ch : upper) ch = char(toupper(uint8_t(ch)));
+        if (upper != want || size < 24)
+            continue;
+        const uint8_t* x = static_cast<const uint8_t*>(g_memory.Translate(address));
+        auto u16 = [&](uint32_t o) { return uint32_t(x[o]) << 8 | x[o + 1]; };
+        auto u32 = [&](uint32_t o) { return uint32_t(x[o]) << 24 | uint32_t(x[o + 1]) << 16 | uint32_t(x[o + 2]) << 8 | x[o + 3]; };
+        if (memcmp(x, "XDBF", 4) != 0)
+            return false;
+        const uint32_t entryTable = u32(8), entries = u32(12), freeTable = u32(16);
+        const uint32_t dataStart = 24 + entryTable * 18 + freeTable * 8;
+        for (uint32_t k = 0; k < entries && 24 + (k + 1) * 18 <= size; k++)
+        {
+            const uint32_t e = 24 + k * 18;
+            const uint32_t ns = u16(e);
+            const uint64_t id = uint64_t(u32(e + 2)) << 32 | u32(e + 6);
+            const uint32_t off = u32(e + 10), len = u32(e + 14);
+            if (ns != 2 || id != 0x8000 || dataStart + off + len > size || len < 8)
+                continue;
+            std::ofstream f(out, std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char*>(x + dataStart + off), len);
+            LOGFN("[xex] title image ({} bytes) written to {}", len, (const char*)out.u8string().c_str());
+            return bool(f);
+        }
+        return false;
+    }
+    return false;
+}
+
 uint32_t XexGetModuleSection(uint32_t module, const char* name, be<uint32_t>* data, be<uint32_t>* size)
 {
     for (auto& s : g_xex.sections)

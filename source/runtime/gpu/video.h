@@ -12,6 +12,8 @@ namespace Video
 {
     // Creates the SDL window (hidden unless --window) and the Vulkan device/swapchain.
     bool CreateHostDevice(const char* sdlVideoDriver = nullptr);
+    // Step 38: why CreateHostDevice failed, in words for the player (empty if it did not fail)
+    const std::string& StartupError();
     bool IsCreated();
     void ToggleFullscreen();
     void PumpEvents();

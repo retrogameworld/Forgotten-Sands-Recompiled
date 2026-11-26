@@ -15,8 +15,27 @@ std::filesystem::path os::process::GetExecutablePath()
     }
 }
 
+
 std::filesystem::path os::process::GetExecutableRoot()
 {
+#ifdef __ANDROID__
+    // Step 37: on Android "next to the exe" is the app's own folder on the shared storage
+    // (Android/data/<package>/files): the disc image, game folder, settings, saves and log live there.
+    // (also called by static constructors at library load, before SDL's Java side is ready: built from the
+    // package name instead of SDL_AndroidGetExternalStoragePath)
+    static const std::filesystem::path s_root = []
+    {
+        char cmd[256] = {};
+        if (FILE* f = fopen("/proc/self/cmdline", "rb")) { fread(cmd, 1, sizeof(cmd) - 1, f); fclose(f); }
+        std::string pkg = cmd;
+        if (auto c = pkg.find(':'); c != std::string::npos) pkg.resize(c);
+        auto dir = std::filesystem::path("/storage/emulated/0/Android/data") / pkg / "files";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        return dir / "";
+    }();
+    return s_root;
+#endif
     return GetExecutablePath().remove_filename();
 }
 

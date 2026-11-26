@@ -100,6 +100,9 @@ std::string CurrentGuestCallChain(int maxFrames)
     }
     return out;
 }
+#else
+// Step 37: no host stack walk here (Android); the Windows version lists the recompiled guest frames
+std::string CurrentGuestCallChain(int) { return std::string(); }
 #endif
 #ifdef _WIN32
 std::string SymbolizeHostAddress(uint64_t address)
@@ -159,15 +162,32 @@ GuestThreadContext::~GuestThreadContext()
 static thread_local std::jmp_buf* t_exitJump;
 static thread_local uint32_t t_exitCode;
 
+// Step 37: the processor number the game reads from the PCR (lbz 268(r13)) follows the thread's affinity. It used to
+// come only from the creation flags, so threads placed with KeSetAffinityThread (almost all of them) said "processor 0"
+// and shared per-processor data and "am I on this core?" answers. FS_NO_PCR_AFFINITY=1: old behaviour.
+static thread_local GuestThreadHandle* t_startHandle = nullptr;
+bool PcrAffinityOn() { static const bool s_on = getenv("FS_PCR_AFFINITY") != nullptr; return s_on; } // opt-in: with it on, 3 freezes in 22 runs (the job rings are per processor)
+int ProcessorOfAffinity(uint32_t affinity)
+{
+    if (affinity == 0 || (affinity & (affinity - 1)) != 0 || affinity > 0x20) return -1;
+    return std::countr_zero(affinity);
+}
+
 static void GuestThreadFunc(GuestThreadHandle* hThread)
 {
+    t_startHandle = hThread;
 #ifdef _WIN32
     // Keep 64 KB for the crash handler, so a stack overflow is reported instead of a silent exit.
     ULONG guarantee = 0x10000;
     SetThreadStackGuarantee(&guarantee);
 #endif
     hThread->suspended.wait(true);
+    extern void CoreGateThreadStart(uint32_t affinity, int priority);
+    CoreGateThreadStart(hThread->affinity, hThread->priority);
     hThread->exitCode = GuestThread::Start(hThread->params);
+    hThread->pcr = 0;
+    extern void CoreGateThreadEnd();
+    CoreGateThreadEnd();
     hThread->finished = true;
     hThread->finished.notify_all();
 }
@@ -287,9 +307,12 @@ void GuestThread::DumpAll()
 uint32_t GuestThread::Start(const GuestThreadParams& params)
 {
     const auto procMask = (uint8_t)(params.flags >> 24);
-    const auto cpuNumber = procMask == 0 ? 0 : 7 - std::countl_zero(procMask);
+    auto cpuNumber = procMask == 0 ? 0 : 7 - std::countl_zero(procMask);
+    if (t_startHandle && PcrAffinityOn() && ProcessorOfAffinity(t_startHandle->affinity) >= 0)
+        cpuNumber = ProcessorOfAffinity(t_startHandle->affinity);
 
     GuestThreadContext ctx(cpuNumber, params.stackSize);
+    if (t_startHandle) t_startHandle->pcr = ctx.ppcContext.r13.u32;
     ThreadRecordScope record(params.function, &ctx.ppcContext);
 
     std::jmp_buf exitJump;

@@ -98,3 +98,14 @@ v1.8.2505.1 in `tools\dxc-src` and FFmpeg 8.1.3 in `tools\ffmpeg-src`.
 
 For development, `files/env.txt` in the app's folder can hold `KEY=VALUE` lines that the game reads as environment
 variables (the `FS_*` switches above).
+
+## Releasing a new version (Windows)
+
+Versions are 1.0, 1.1, 1.2, ... for changes and fixes, 2.0 for big changes (releases before 1.0 were named by date).
+For every release:
+
+1. Add a `## <version> (<date>)` entry with the changes at the top of [CHANGELOG.md](CHANGELOG.md), and update the
+   version line and the "Changelog" section of the README.
+2. Build the program, make the zip in `release/`, and upload. The upload takes the version from the top of
+   CHANGELOG.md (release tag `v<version>`, that entry as the release notes) and stops if that version was already
+   released.

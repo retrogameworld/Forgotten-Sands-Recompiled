@@ -1,3 +1,4 @@
+#include <deque>
 #include <stdafx.h>
 #include "function.h"
 #include "import_log.h"
@@ -280,10 +281,47 @@ uint32_t MmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t size, uint32_t prot
     return address;
 }
 
+// Step 37 (Odin: a rare hang - a sound voice's lock was looked for in memory that by then held another object): physical
+// memory the game frees is handed out again only 2 s later (at most 64 MB held back), like the console, where freed
+// memory was not reused within a few milliseconds by the next allocation. FS_FREE_NOW=1: freed at once.
 void MmFreePhysicalMemory(uint32_t type, uint32_t guestAddress)
 {
-    if (guestAddress != 0)
+    if (guestAddress == 0)
+        return;
+    static const bool s_now = getenv("FS_HOLD_FREES") == nullptr; // Step 37: OFF by default - measured: with it on, 5 of 8 PC runs crashed; off (as before), 0 of 20. Opt-in for tests.
+    if (s_now)
+    {
         g_userHeap.Free(g_memory.Translate(guestAddress));
+        return;
+    }
+    struct Held { uint32_t address; size_t size; std::chrono::steady_clock::time_point at; };
+    static std::mutex s_m;
+    static std::deque<Held> s_held;
+    static size_t s_heldBytes = 0;
+    static uint64_t s_frees = 0;
+    const size_t size = g_userHeap.Size(g_memory.Translate(guestAddress));
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<uint32_t> due;
+    {
+        std::lock_guard l(s_m);
+        s_held.push_back({ guestAddress, size, now });
+        s_heldBytes += size;
+        s_frees++;
+        while (!s_held.empty() && (now - s_held.front().at > std::chrono::seconds(2) || s_heldBytes > (64u << 20)))
+        {
+            due.push_back(s_held.front().address);
+            s_heldBytes -= s_held.front().size;
+            s_held.pop_front();
+        }
+        static auto s_log = now;
+        if (now - s_log > std::chrono::seconds(10))
+        {
+            s_log = now;
+            LOGFN("[mem] physical frees so far {}, held back now {} ({:.1f} MB)", s_frees, s_held.size(), s_heldBytes / 1048576.0);
+        }
+    }
+    for (uint32_t a : due)
+        g_userHeap.Free(g_memory.Translate(a));
 }
 
 uint32_t MmGetPhysicalAddress(uint32_t address)

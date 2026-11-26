@@ -1284,7 +1284,7 @@ uint32_t NtReadFile(uint32_t FileHandleIn, uint32_t Event, uint32_t ApcRoutine, 
     if (ioTrace)
     {
         extern std::string CurrentGuestCallChain(int maxFrames);
-        LOGFN("[io] read 0x{:08X} +0x{:X} at 0x{:X} \"{}\" thread {} |{}", g_memory.MapVirtual(Buffer), read, file->position - read, file->guestPath, GetCurrentThreadId(), CurrentGuestCallChain(8));
+        LOGFN("[io] read 0x{:08X} +0x{:X} at 0x{:X} \"{}\" thread {} |{}", g_memory.MapVirtual(Buffer), read, file->position - read, file->guestPath, std::hash<std::thread::id>{}(std::this_thread::get_id()), CurrentGuestCallChain(8));
     }
     // Step 10 debug: TL_PAK_TRACE=1 logs every read of pak.zip (offset, length) - map offsets to zip entries
     // with work\playthrough\pakmap.py to see which game files a load reads.

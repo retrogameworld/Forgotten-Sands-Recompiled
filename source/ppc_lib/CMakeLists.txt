@@ -8,7 +8,15 @@ set(CMAKE_CXX_STANDARD 20)
 if (NOT DEFINED FS_ROOT)
     get_filename_component(FS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE) # <project folder> (src/ppc_lib/../..)
 endif()
-set(FS_PPC_DIR "${FS_ROOT}/builds/ppc")
+# Step 37: Android builds the translation made with src/config/FS_arm.toml (builds/ppc_arm: the same code plus real
+# memory barriers for sync / lwsync / eieio, which x86 does not need)
+if (NOT DEFINED FS_PPC_DIR)
+    if (ANDROID)
+        set(FS_PPC_DIR "${FS_ROOT}/builds/ppc_arm")
+    else()
+        set(FS_PPC_DIR "${FS_ROOT}/builds/ppc")
+    endif()
+endif()
 
 file(GLOB FS_PPC_SOURCES "${FS_PPC_DIR}/ppc_recomp.*.cpp")
 list(APPEND FS_PPC_SOURCES "${FS_PPC_DIR}/ppc_func_mapping.cpp")
@@ -17,6 +25,7 @@ add_library(ForgottenSandsPPC STATIC ${FS_PPC_SOURCES})
 target_include_directories(ForgottenSandsPPC PUBLIC
     "${FS_PPC_DIR}"
     "${FS_ROOT}/tools/XenonRecomp/thirdparty/simde")
+if (MSVC)
 target_compile_options(ForgottenSandsPPC PRIVATE
     -march=x86-64-v3 # Step 35: AVX2 + MOVBE (byte-swapped loads) + BMI; /fp:strict keeps FMA contraction off
     -fno-strict-aliasing
@@ -24,3 +33,19 @@ target_compile_options(ForgottenSandsPPC PRIVATE
     /fp:strict
     "/FI${CMAKE_CURRENT_SOURCE_DIR}/fs_ppc_overrides.h" # PPC_CALL_INDIRECT_FUNC with a missing-function report
     /GS-) # no stack cookies: setjmp/longjmp (PPC_SETJMP) returns into frames twice
+else()
+# Android / Linux (Step 37): the same meaning with GCC-style flags. ARM64: no FMA contraction (the guest rounds
+# every multiply and add on its own), no stack protector (setjmp/longjmp), no strict aliasing.
+target_compile_options(ForgottenSandsPPC PRIVATE
+    -ffp-contract=off
+    -fno-strict-aliasing
+    -fno-stack-protector
+    -Wno-everything
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/fs_ppc_overrides.h")
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(ForgottenSandsPPC PRIVATE -march=x86-64-v3)
+endif()
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    target_compile_options(ForgottenSandsPPC PRIVATE -march=armv8.2-a+rcpc) # LSE atomics, LDAPR (Step 37: load-acquire for every guest load)
+endif()
+endif()

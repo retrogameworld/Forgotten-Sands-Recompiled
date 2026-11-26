@@ -122,10 +122,18 @@ static void PrintUsage()
     printf("ForgottenSandsRecomp.exe [--game <folder>] [--xex <file>] [--window] [--verbose] [--timeout <seconds>] [--quiet-files] [--shot <seconds> <file.bmp>] [--input-script <file>]\n");
 }
 
+#ifdef __ANDROID__
+// Step 37: SDL's Java side (SDLActivity) loads libmain.so and calls SDL_main.
+extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char* argv[])
+#else
 int main(int argc, char* argv[])
+#endif
 {
 #ifdef _WIN32
     timeBeginPeriod(1);
+    // Step 37 test switch: FS_PROCESS_CPUS=<hex mask> runs the whole game on those host CPUs only (race tests).
+    if (const char* m = getenv("FS_PROCESS_CPUS"))
+        SetProcessAffinityMask(GetCurrentProcess(), DWORD_PTR(strtoull(m, nullptr, 16)));
 #endif
 
     os::process::CheckConsole();
@@ -136,11 +144,18 @@ int main(int argc, char* argv[])
 
     const auto exeRoot = os::process::GetExecutableRoot();
     // Launch history (before anything that could fail): proves a run started even if it dies before the log.
+#ifdef _WIN32
     if (FILE* h = _wfopen((exeRoot / "launch_history.txt").c_str(), L"a"))
     {
+        const unsigned long pid = GetCurrentProcessId();
+#else
+    if (FILE* h = fopen((exeRoot / "launch_history.txt").c_str(), "a"))
+    {
+        const unsigned long pid = (unsigned long)getpid();
+#endif
         const auto t = std::time(nullptr);
         char when[64]; std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
-        fprintf(h, "%s start pid %lu args:", when, GetCurrentProcessId());
+        fprintf(h, "%s start pid %lu args:", when, pid);
         for (int i = 1; i < argc; i++) fprintf(h, " %s", argv[i]);
         fputc('\n', h);
         fclose(h);
@@ -179,8 +194,15 @@ int main(int argc, char* argv[])
         else printf("Unknown argument: %s\n", argv[i]);
     }
 
+    // Step 37: FS_SHOT=<seconds>:<file.bmp> - the same as --shot (Android has no command line; test runs set it in
+    // files/env.txt)
+    if (const char* e = getenv("FS_SHOT"); e && strchr(e, ':'))
+        shots.emplace_back(uint32_t(atoi(e)), std::filesystem::path(strchr(e, ':') + 1));
     os::logger::g_verbose = Config::Verbose;
     os::logger::Init(*logFile);
+#ifdef __ANDROID__
+    os::logger::CaptureStderr();
+#endif
     InstallCrashHandler();
     Perf::Init(); // TL_PROFILE=<from>-<to> seconds: sampling profile of all threads (os/perf.cpp)
 
@@ -219,6 +241,15 @@ int main(int argc, char* argv[])
     }
 
     KernelStartTimeStampUpdater();
+#ifdef __ANDROID__
+    // Step 37: the app's home-screen icon comes from the player's own game (see XexWriteTitleImage)
+    {
+        std::error_code ec;
+        const auto icon = exeRoot / "title_icon.png";
+        if (!std::filesystem::exists(icon, ec))
+            XexWriteTitleImage(icon);
+    }
+#endif
 
     if (!mirrors.empty())
     {
@@ -238,6 +269,9 @@ int main(int argc, char* argv[])
     if (!Video::CreateHostDevice())
     {
         LOGN_ERROR("Could not create the Vulkan device; the game cannot render.");
+        // Step 38: say why on screen (was: the window closed / stayed black with no word)
+        ShowMessage(true, "The game cannot start on this GPU.\n\n" + (Video::StartupError().empty() ? std::string("Vulkan device creation failed.") : Video::StartupError()) +
+            "\n\nPlease report it with the file ForgottenSandsRecomp.log (on Android: Android/data/com.fsrecomp.forgottensands/files).");
         return 1;
     }
 
@@ -281,6 +315,23 @@ int main(int argc, char* argv[])
         // Presentation happens on the guest render thread (Swap/Present hooks); here we only
         // pump window events and schedule test screenshots.
         const auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
+        // Step 37: FS_SHOT_ON_COMBO=<folder> (a tester at a spot that cannot be reached by script): clicking both sticks (L3 + R3)
+        // saves a screenshot there (with FS_SHOT_BURST=<n> also the next n frames), at most every 5 s.
+        if (static const char* s_comboDir = getenv("FS_SHOT_ON_COMBO"); s_comboDir && *s_comboDir)
+        {
+            static auto s_last = std::chrono::steady_clock::time_point{};
+            static int s_n = 0;
+            XAMINPUT_STATE pad{};
+            const auto now = std::chrono::steady_clock::now();
+            if (hid::GetState(0, &pad) == 0 && (pad.Gamepad.wButtons & (XAMINPUT_GAMEPAD_LEFT_THUMB | XAMINPUT_GAMEPAD_RIGHT_THUMB)) == (XAMINPUT_GAMEPAD_LEFT_THUMB | XAMINPUT_GAMEPAD_RIGHT_THUMB) &&
+                now - s_last > std::chrono::seconds(5))
+            {
+                s_last = now;
+                const auto path = std::filesystem::path(s_comboDir) / fmt::format("combo{}.bmp", ++s_n);
+                LOGFN("Screenshot by button combo ({} frames presented so far): {}", Video::GetPresentedFrameCount(), (const char*)path.u8string().c_str());
+                Video::RequestScreenshot(path);
+            }
+        }
         for (auto it = shots.begin(); it != shots.end();)
         {
             if (uint64_t(elapsedSeconds) >= it->first)

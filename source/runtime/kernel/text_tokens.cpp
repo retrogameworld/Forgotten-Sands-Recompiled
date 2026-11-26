@@ -6,6 +6,7 @@
 #include <kernel/function.h>
 #include <kernel/memory.h>
 #include <os/logger.h>
+#include <user/config.h>
 #include <set>
 #include <mutex>
 
@@ -131,8 +132,12 @@ PPC_FUNC(sub_821CA5A0)
 PPC_FUNC_IMPL(__imp__sub_8268CF98);
 PPC_FUNC(sub_8268CF98)
 {
-    static const bool s_xbox = getenv("FS_XBOX_ICONS") != nullptr;
-    if (s_xbox) { __imp__sub_8268CF98(ctx, base); return; }
+    // Step 37 (the tester, Odin: "square is Y / x = B / circle = A / triangle = X"): button_style "odin" keeps the PS3
+    // pictures for the sticks, d-pad, L1/R1/L2/R2, START and SELECT, and shows the four face buttons with the 360
+    // letter pictures of the letters printed on the device: bottom button (360 A) = B, right (360 B) = A, left
+    // (360 X) = Y, top (360 Y) = X. FS_BUTTON_STYLE=playstation|xbox|odin overrides the setting (tests).
+    static const Config::ButtonStyle s_style = Config::EffectiveButtonStyle();
+    if (s_style == Config::ButtonStyle::Xbox) { __imp__sub_8268CF98(ctx, base); return; }
 
     constexpr uint32_t kXbox = 0x82F42F38, kPs3 = 0x82F42FC0, kCount = 35; // XBOX360_DPAD_UP .. XBOX360_DPAD_Y
     static std::mutex s_m;
@@ -144,6 +149,11 @@ PPC_FUNC(sub_8268CF98)
     {
         saved[i] = xbox[i];
         xbox[i] = ps3[i < 20 ? i : i + 4];
+    }
+    if (s_style == Config::ButtonStyle::Odin)
+    {
+        // entries 10..13 = XBOX360_A, _B, _X, _Y
+        xbox[10] = saved[11]; xbox[11] = saved[10]; xbox[12] = saved[13]; xbox[13] = saved[12];
     }
     __imp__sub_8268CF98(ctx, base);
     for (uint32_t i = 0; i < kCount; i++)

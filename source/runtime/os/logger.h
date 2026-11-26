@@ -6,7 +6,7 @@
 #include <source_location>
 
 #define LOG_IMPL(type, func, str)       os::logger::Log(str, os::logger::ELogType::type, func)
-#define LOGF_IMPL(type, func, str, ...) os::logger::Log(fmt::format(str, __VA_ARGS__), os::logger::ELogType::type, func)
+#define LOGF_IMPL(type, func, str, ...) os::logger::Log(fmt::format(str __VA_OPT__(,) __VA_ARGS__), os::logger::ELogType::type, func)
 
 #define LOG(str)               LOG_IMPL(None, __func__, str)
 #define LOG_WARNING(str)       LOG_IMPL(Warning, __func__, str)
@@ -43,5 +43,6 @@ namespace os::logger
     void Init(const std::filesystem::path& logFile = {});
     void Log(const std::string_view str, ELogType type = ELogType::None, const char* func = nullptr);
     void Flush();
+    void CaptureStderr(); // Step 38 (Android): lines written to stderr (plume's Vulkan errors) go into the log
     void Reopen(const std::filesystem::path& logFile); // closes the current log file, starts a new one
 }

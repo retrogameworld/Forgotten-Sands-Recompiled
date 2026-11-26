@@ -1,3 +1,4 @@
+#include <deque>
 #include <condition_variable>
 #include <map>
 #include <array>
@@ -83,7 +84,21 @@ namespace
         uint64_t cutFrom = 0, cutTo = 0;                                 // Step 35o: decoded samples [cutFrom, cutTo) of this sound are left out
     };
 
-    std::mutex g_xmaMutex;
+    std::recursive_mutex g_xmaMutex;
+    std::atomic<int> g_kicksRunning{0}; // Step 37: kicks writing context memory right now (WorkContext waits)
+    // Step 37: the kernel XMA functions (called by other game threads) wait up to 10 ms for a running kick before
+    // they take the lock - like the console, where these calls never overlapped a kick's context writes. (Not
+    // longer: a caller may hold a game lock the kick needs; holding g_xmaMutex across the kick froze the game.)
+    thread_local bool t_inKick = false;
+    std::unique_lock<std::recursive_mutex> LockForImport()
+    {
+        if (t_inKick) // (the kick's own code calling in)
+            return std::unique_lock<std::recursive_mutex>(g_xmaMutex);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+        while (g_kicksRunning.load() > 0 && std::chrono::steady_clock::now() < until)
+            std::this_thread::yield();
+        return std::unique_lock<std::recursive_mutex>(g_xmaMutex);
+    }
     std::unordered_map<uint32_t, XmaContext*> g_xmaContexts;
     std::atomic<bool> g_xmaThreadRunning{ false };
     std::atomic<int> g_xmaFreeze{ 0 }; // > 0: the sound engine is reading its contexts back (sub_82D01DA0)
@@ -510,6 +525,9 @@ namespace
 
     void WorkContext(XmaContext& c)
     {
+        // Step 37: hands off every context while the sound engine's kick writes context memory (see sub_82D01F10).
+        if (g_kicksRunning.load() > 0)
+            return;
         // Step 35f: hands off while the sound engine has the context locked (see the sub_82D01DA0 hook).
         if (c.kicked && g_xmaFreeze.load(std::memory_order_relaxed) > 0)
             return;
@@ -744,14 +762,71 @@ namespace
 // ---------------------------------------------------------------------------------------------
 // Kernel XMA helpers (same semantics as Xenia's xboxkrnl_audio_xma.cc)
 
+// Step 37 (the rare crash / freeze, PC and Odin): on the console XMA contexts live in the audio hardware's own
+// context array, so a released context's memory never becomes anything else. Here it went back to the general
+// heap and was handed out again at once - but the sound engine's kick (sub_82D01F10) copies 48 bytes of a voice's
+// context state into the context pointer it read from the voice, and the voice teardown (sub_82D01688) releases
+// that context without the kick's lock. A kick that raced a teardown then wrote over whatever object had just
+// been given that memory (seen as critical sections in the game's data holding "voice + 0x01000000", and as
+// voice objects with a vtable of 1). Contexts now come from a pool of their own, handed out round-robin, so a
+// late write can only land in an unused (or another) XMA context, like on the console. FS_XMA_HEAP_CONTEXTS=1: old.
+struct XmaContextPool
+{
+    static constexpr uint32_t SLOTS = 1024, STRIDE = 0x100;
+    std::mutex m;
+    uint32_t base = 0;
+    std::deque<uint32_t> free;
+};
+static XmaContextPool g_xmaPool;
+static bool XmaHeapContexts() { static const bool s_heap = getenv("FS_XMA_HEAP_CONTEXTS") != nullptr; return s_heap; }
+
+static uint32_t AllocContextMemory()
+{
+    if (!XmaHeapContexts())
+    {
+        std::lock_guard l(g_xmaPool.m);
+        if (g_xmaPool.base == 0)
+        {
+            if (void* pool = g_userHeap.AllocPhysical(XmaContextPool::SLOTS * XmaContextPool::STRIDE, 0x1000))
+            {
+                memset(pool, 0, XmaContextPool::SLOTS * XmaContextPool::STRIDE);
+                g_xmaPool.base = g_memory.MapVirtual(pool);
+                for (uint32_t i = 0; i < XmaContextPool::SLOTS; i++) g_xmaPool.free.push_back(g_xmaPool.base + i * XmaContextPool::STRIDE);
+                LOGFN("[xma] context pool at 0x{:08X} ({} contexts)", g_xmaPool.base, XmaContextPool::SLOTS);
+            }
+        }
+        if (!g_xmaPool.free.empty())
+        {
+            const uint32_t a = g_xmaPool.free.front();
+            g_xmaPool.free.pop_front();
+            return a;
+        }
+        LOGFN_ERROR("[xma] context pool exhausted, using the heap");
+    }
+    void* mem = g_userHeap.AllocPhysical(0x40, 0x100);
+    return mem ? g_memory.MapVirtual(mem) : 0;
+}
+
+static void FreeContextMemory(uint32_t address)
+{
+    {
+        std::lock_guard l(g_xmaPool.m);
+        if (g_xmaPool.base != 0 && address >= g_xmaPool.base && address < g_xmaPool.base + XmaContextPool::SLOTS * XmaContextPool::STRIDE)
+        {
+            g_xmaPool.free.push_back(address); // back of the queue: reused as late as possible
+            return;
+        }
+    }
+    g_userHeap.Free(g_memory.Translate(address));
+}
+
 uint32_t XMACreateContext(be<uint32_t>* context)
 {
     EnsureThread();
-    void* mem = g_userHeap.AllocPhysical(0x40, 0x100);
-    memset(mem, 0, 0x40);
-    const uint32_t address = g_memory.MapVirtual(mem);
+    const uint32_t address = AllocContextMemory();
+    memset(g_memory.Translate(address), 0, 0x40);
     *context = address;
-    std::lock_guard lock(g_xmaMutex);
+    auto lock = LockForImport();
     Lookup(address);
     return 0;
 }
@@ -759,7 +834,7 @@ uint32_t XMACreateContext(be<uint32_t>* context)
 uint32_t XMAReleaseContext(uint32_t context)
 {
     {
-        std::lock_guard lock(g_xmaMutex);
+        auto lock = LockForImport();
         auto it = g_xmaContexts.find(context);
         if (it != g_xmaContexts.end())
         {
@@ -768,8 +843,38 @@ uint32_t XMAReleaseContext(uint32_t context)
             g_xmaContexts.erase(it);
         }
     }
+    // Step 37 (Odin: crashes in the sound engine's voice code right after a kick, the kicked voice in r3): the
+    // context memory went back to the heap at once and was handed out again (voice objects) while the sound
+    // engine still read the released context through a voice. On the console that window is too short to matter;
+    // on the phone it was not. Released context memory is now freed 2 s later. FS_XMA_FREE_NOW=1: at once.
     if (context)
-        g_userHeap.Free(g_memory.Translate(context));
+    {
+        static const bool s_now = getenv("FS_XMA_FREE_LATER") == nullptr; // Step 37: OFF by default - measured: with it on, 5 of 8 PC runs crashed; off (as before), 0 of 20. Opt-in for tests.
+        static std::mutex s_m;
+        static std::deque<std::pair<uint32_t, std::chrono::steady_clock::time_point>> s_later;
+        if (s_now)
+        {
+            FreeContextMemory(context);
+            return 0;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<uint32_t> due;
+        {
+            std::lock_guard l(s_m);
+            s_later.emplace_back(context, now);
+            while (!s_later.empty() && now - s_later.front().second > std::chrono::seconds(2))
+            {
+                due.push_back(s_later.front().first);
+                s_later.pop_front();
+            }
+        }
+        for (uint32_t a : due)
+        {
+            std::lock_guard lock(g_xmaMutex);
+            if (g_xmaContexts.find(a) == g_xmaContexts.end()) // (not created again at the same address meanwhile)
+                FreeContextMemory(a);
+        }
+    }
     return 0;
 }
 
@@ -784,7 +889,7 @@ struct XmaContextInit
 uint32_t XMAInitializeContext(uint32_t context, XmaContextInit* init)
 {
     EnsureThread();
-    std::lock_guard lock(g_xmaMutex);
+    auto lock = LockForImport();
     XmaContext* c = Lookup(context);
     c->firstOutLogged = false;
     {
@@ -827,7 +932,7 @@ uint32_t XMAEnableContext(uint32_t context)
     EnsureThread();
     static const bool s_noMusic = getenv("FS_XMA_NO_IMPORT_ENABLE") != nullptr; // debug: silence the music voices
     if (s_noMusic) return 0;
-    std::lock_guard lock(g_xmaMutex);
+    auto lock = LockForImport();
     Lookup(context)->enabled = true;
     if (ENV_FLAG("FS_XMA_TRACE")) LOGFN("[xma] enable 0x{:08X}", context);
     return 0;
@@ -835,7 +940,7 @@ uint32_t XMAEnableContext(uint32_t context)
 
 uint32_t XMADisableContext(uint32_t context, uint32_t wait)
 {
-    std::lock_guard lock(g_xmaMutex);
+    auto lock = LockForImport();
     Lookup(context)->enabled = false;
     if (ENV_FLAG("FS_XMA_TRACE")) LOGFN("[xma] disable 0x{:08X}", context);
     return 0;
@@ -850,12 +955,12 @@ static void TraceRefill(uint32_t context, int buffer)
         LOGFN("[xma] refill 0x{:08X} buf{}: ptr 0x{:08X} packets {} cur {} read {} w{} r{}", context, buffer, Get(context, buffer ? DW_IN1 : DW_IN0),
             buffer ? Field(context, DW1, 0, 12) : Field(context, DW0, 0, 12), Field(context, DW4, 31, 1), Field(context, DW2, 0, 26), Field(context, DW0, 27, 5), Field(context, DW9, 0, 5));
 }
-uint32_t XMASetInputBuffer0Valid(uint32_t context) { TraceRefill(context, 0); SetField(context, DW0, 20, 1, 1); return 0; }
-uint32_t XMASetInputBuffer1Valid(uint32_t context) { TraceRefill(context, 1); SetField(context, DW0, 21, 1, 1); return 0; }
+uint32_t XMASetInputBuffer0Valid(uint32_t context) { auto lock = LockForImport(); TraceRefill(context, 0); SetField(context, DW0, 20, 1, 1); return 0; }
+uint32_t XMASetInputBuffer1Valid(uint32_t context) { auto lock = LockForImport(); TraceRefill(context, 1); SetField(context, DW0, 21, 1, 1); return 0; }
 uint32_t XMAIsOutputBufferValid(uint32_t context) { return Field(context, DW1, 31, 1); }
-uint32_t XMASetOutputBufferValid(uint32_t context) { SetField(context, DW1, 31, 1, 1); return 0; }
+uint32_t XMASetOutputBufferValid(uint32_t context) { auto lock = LockForImport(); SetField(context, DW1, 31, 1, 1); return 0; }
 uint32_t XMAGetOutputBufferReadOffset(uint32_t context) { return Field(context, DW9, 0, 5); }
-uint32_t XMASetOutputBufferReadOffset(uint32_t context, uint32_t offset) { SetField(context, DW9, 0, 5, offset & 0x1F); return 0; }
+uint32_t XMASetOutputBufferReadOffset(uint32_t context, uint32_t offset) { auto lock = LockForImport(); SetField(context, DW9, 0, 5, offset & 0x1F); return 0; }
 uint32_t XMAGetOutputBufferWriteOffset(uint32_t context) { return Field(context, DW0, 27, 5); }
 
 uint64_t XmaDecodedPackets() { return g_xmaPackets.load(); }
@@ -1085,6 +1190,32 @@ PPC_FUNC_IMPL(__imp__sub_82D01F10);
 PPC_FUNC(sub_82D01F10)
 {
     const uint32_t voice = ctx.r3.u32;
+    // Step 37: a voice entry whose context pointer is not an XMA context (a torn-down voice's entries that already
+    // hold something else): the kick would copy 48 bytes of context state there. Its "changed" flags are cleared so
+    // the kick copies nothing for it. FS_NO_KICK_CHECK=1: off.
+    if (static const bool s_check = getenv("FS_NO_KICK_CHECK") == nullptr && !XmaHeapContexts(); s_check)
+    {
+        auto W0 = [&](uint32_t a) { return uint32_t(*reinterpret_cast<be<uint32_t>*>(base + a)); };
+        const uint32_t count0 = W0(voice), entries0 = W0(voice + 8);
+        uint32_t poolBase, poolEnd;
+        { std::lock_guard l(g_xmaPool.m); poolBase = g_xmaPool.base; poolEnd = poolBase + XmaContextPool::SLOTS * XmaContextPool::STRIDE; }
+        if (poolBase != 0 && count0 <= 16 && entries0 != 0)
+            for (uint32_t i = 0; i < count0; i++)
+            {
+                const uint32_t e = entries0 + i * 96, c = W0(e + 64);
+                if (c == 0 || (c >= poolBase && c < poolEnd && (c & 0xFF) == 0))
+                    continue;
+                static std::atomic<int> s_n{0};
+                if (s_n++ < 20)
+                {
+                    extern std::string CurrentGuestCallChain(int maxFrames);
+                    LOGFN("[xma] kick of voice 0x{:08X} entry {}: context pointer 0x{:08X} is not an XMA context - not copied (r13 0x{:08X}) |{}", voice, i, c, ctx.r13.u32, CurrentGuestCallChain(10));
+                }
+                *reinterpret_cast<be<uint32_t>*>(base + e + 48) = 0u;
+                *reinterpret_cast<be<uint32_t>*>(base + e + 52) = 0u;
+                *reinterpret_cast<be<uint32_t>*>(base + e + 56) = 0u;
+            }
+    }
     {
         auto W0 = [&](uint32_t a) { return uint32_t(*reinterpret_cast<be<uint32_t>*>(base + a)); };
         const uint32_t count0 = W0(voice), entries0 = W0(voice + 8);
@@ -1095,7 +1226,24 @@ PPC_FUNC(sub_82D01F10)
                 W0(entries0 + 48) ? 1 : 0, W0(entries0 + 52) ? 1 : 0, W0(entries0 + 56) ? 1 : 0, context0 ? Get(context0, DW0) : 0, context0 ? Get(context0, DW1) : 0, context0 ? Get(context0, DW2) : 0, context0 ? Get(context0, DW9) : 0);
         }
     }
+    // Step 37 (Odin crashes in voice code just after a kick, the kicked voice in r4): the kick copies the voice's
+    // changed context words into the context memory while the decoder thread could be reading that context - a
+    // new output buffer with the old block count, for example, and samples were written past the new buffer into
+    // the objects next to it. The decoder now waits while the kick writes. FS_XMA_KICK_UNLOCKED=1 = as before.
+    // (Not by holding g_xmaMutex across the game's code: the kick enters the game's own locks, and a game thread
+    // holding one of those while calling an XMA function waited for g_xmaMutex - the game froze on the tester's Odin.
+    // The decoder thread skips every context while a kick runs; a decode already running is waited for.)
+    static const bool s_unlocked = getenv("FS_XMA_KICK_PAUSE") == nullptr; // Step 37: OFF by default - measured: with it on, 5 of 8 PC runs crashed; off (as before), 0 of 20. Opt-in for tests.
+    if (!s_unlocked)
+    {
+        std::lock_guard wait(g_xmaMutex); // a decode in progress finishes first
+        g_kicksRunning++;
+    }
+    t_inKick = true;
     __imp__sub_82D01F10(ctx, base);
+    t_inKick = false;
+    if (!s_unlocked)
+        g_kicksRunning--;
     static const bool s_off = getenv("FS_NO_XMA_KICK") != nullptr;
     if (s_off)
         return;
@@ -1110,6 +1258,19 @@ PPC_FUNC(sub_82D01F10)
         const uint32_t context = W(entries + i * 96 + 64);
         if (context == 0)
             continue;
+        // Step 37 (crashes on the Odin in voice code, right at a kick, with the kicked voice in r3): a kick of a
+        // context the game had already released (XMAReleaseContext frees its memory) made a new tracking entry
+        // here, and the decoder thread then kept writing context fields and samples into that freed memory -
+        // which the game had handed out again (a voice object). Only contexts we know (created or initialised
+        // and not released) are run. FS_XMA_KICK_ANY=1 = as before.
+        static const bool s_kickAny = getenv("FS_XMA_KICK_KNOWN") == nullptr; // Step 37: OFF by default - measured: with it on, 5 of 8 PC runs crashed; off (as before), 0 of 20. Opt-in for tests.
+        if (!s_kickAny && g_xmaContexts.find(context) == g_xmaContexts.end())
+        {
+            static std::atomic<int> s_unknown{0};
+            if (s_unknown++ < 20)
+                LOGFN("[xma] kick of an unknown (released?) context 0x{:08X} (voice 0x{:08X}) ignored", context, voice);
+            continue;
+        }
         XmaContext* c = Lookup(context);
         // A new sound in the same context: the input read offset went back. Drop the old decoder state and
         // the previous sound's leftover samples, so the new one starts clean.

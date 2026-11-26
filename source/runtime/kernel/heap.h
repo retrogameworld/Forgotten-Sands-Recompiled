@@ -19,15 +19,41 @@ constexpr uint32_t VIRTUAL_END = 0x7FEA0000;
 constexpr uint32_t PHYSICAL_BEGIN = 0xA0000000;
 constexpr uint32_t PHYSICAL_END = 0xC0000000;
 
+// Step 38 (Android 1.1, GitHub issue "invisible textures"): the physical heap was an o1heap, which rounds every
+// block up to a power of two after adding the alignment - the game's 8 MB requests (4 KB aligned) took 16 MB each,
+// so the 512 MB physical memory ran out as the game streamed more ("MmAllocatePhysicalMemoryEx: out of physical
+// memory", then missing level parts / a crash). PhysicalArena = best fit over exact sizes (16-byte granules).
+// FS_O1HEAP_PHYSICAL=1: the old o1heap.
+struct PhysicalArena
+{
+    struct Block { uint32_t start, size, requested; };
+    uint32_t begin = 0, end = 0;
+    std::map<uint32_t, uint32_t> freeByAddr;            // start -> size
+    std::set<std::pair<uint32_t, uint32_t>> freeBySize; // (size, start)
+    ankerl::unordered_dense::map<uint32_t, Block> live; // user address -> block
+    uint64_t used = 0, requested = 0, peakUsed = 0, oomCount = 0, allocs = 0;
+
+    void Init(uint32_t b, uint32_t e);
+    uint32_t Allocate(uint32_t size, uint32_t alignment); // 0 = no room
+    bool Free(uint32_t address);
+    uint32_t Size(uint32_t address) const;
+    uint32_t LargestFree() const { return freeBySize.empty() ? 0 : freeBySize.rbegin()->first; }
+private:
+    void InsertFree(uint32_t start, uint32_t size);
+    void RemoveFree(std::map<uint32_t, uint32_t>::iterator it);
+};
+
 struct Heap
 {
     Mutex mutex;
     O1HeapInstance* heap;
 
     Mutex physicalMutex;
-    O1HeapInstance* physicalHeap;
+    O1HeapInstance* physicalHeap = nullptr; // only with FS_O1HEAP_PHYSICAL=1
+    PhysicalArena physicalArena;
 
     void Init();
+    void LogPhysicalStats(const char* why);
 
     void* Alloc(size_t size);
     void* AllocPhysical(size_t size, size_t alignment);

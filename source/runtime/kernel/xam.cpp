@@ -545,11 +545,19 @@ uint32_t XamInputSetState(uint32_t userIndex, uint32_t flags, XAMINPUT_VIBRATION
 {
     // FS_MUTE (Claude's automated test runs): no rumble on the tester's controller either.
     static const bool s_testRun = [] { const char* m = getenv("FS_MUTE"); return m && *m && *m != '0'; }();
-    if (s_testRun || !hid::IsInputDeviceController() || !Config::Vibration)
+    // Step 37: FS_TEST_RUMBLE_ZERO=1 (test runs): the game's rumble calls go all the way to the controller, but always
+    // with both motors at 0 - the cost of the calls can be measured without anything vibrating.
+    static const bool s_rumbleZero = getenv("FS_TEST_RUMBLE_ZERO") != nullptr;
+    if (!s_rumbleZero && (s_testRun || !hid::IsInputDeviceController() || !Config::Vibration))
         return X_ERROR_SUCCESS;
 
     ByteSwapInplace(vibration->wLeftMotorSpeed);
     ByteSwapInplace(vibration->wRightMotorSpeed);
+    if (s_rumbleZero)
+    {
+        XAMINPUT_VIBRATION zero{};
+        return hid::SetState(userIndex, &zero);
+    }
 
     return hid::SetState(userIndex, vibration);
 }

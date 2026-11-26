@@ -126,10 +126,43 @@ void InstallCrashHandler()
 
 #include <signal.h>
 
-static void CrashSignal(int sig, siginfo_t* si, void*)
+#include <dlfcn.h>
+#include <ucontext.h>
+#include <unwind.h>
+// Step 37: the host code position of a crash (library + offset, for addr2line on the unstripped library)
+static std::string HostPlace(uintptr_t pc)
+{
+    Dl_info info{};
+    if (pc && dladdr((void*)pc, &info) && info.dli_fname)
+    {
+        const char* name = strrchr(info.dli_fname, '/');
+        return fmt::format("{}+0x{:X}{}{}", name ? name + 1 : info.dli_fname, pc - (uintptr_t)info.dli_fbase,
+            info.dli_sname ? " " : "", info.dli_sname ? info.dli_sname : "");
+    }
+    return fmt::format("0x{:X}", pc);
+}
+static _Unwind_Reason_Code CrashUnwind(_Unwind_Context* c, void* arg)
+{
+    auto& out = *static_cast<std::vector<uintptr_t>*>(arg);
+    out.push_back(_Unwind_GetIP(c));
+    return out.size() < 24 ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+
+static void CrashSignal(int sig, siginfo_t* si, void* uc)
 {
     uintptr_t target = (uintptr_t)si->si_addr;
     LOGFN_ERROR("CRASH: signal {} address 0x{:X}", sig, target);
+#if defined(__aarch64__)
+    if (uc)
+    {
+        const auto& m = static_cast<ucontext_t*>(uc)->uc_mcontext;
+        LOGFN_ERROR("  host pc {} lr {}", HostPlace(m.pc), HostPlace(m.regs[30]));
+    }
+#endif
+    std::vector<uintptr_t> frames;
+    _Unwind_Backtrace(CrashUnwind, &frames);
+    for (auto f : frames)
+        LOGFN_ERROR("    {}", HostPlace(f));
     if (target >= (uintptr_t)g_memory.base && target < (uintptr_t)g_memory.base + PPC_MEMORY_SIZE)
         LOGFN_ERROR("  guest address 0x{:08X}", uint32_t(target - (uintptr_t)g_memory.base));
     LogGuestState();
@@ -146,6 +179,16 @@ void InstallCrashHandler()
     sigaction(SIGBUS, &sa, nullptr);
     sigaction(SIGILL, &sa, nullptr);
     sigaction(SIGFPE, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr); // Step 38: an abort() in the GPU driver / C++ library is logged too
+}
+
+// Step 37: see the Windows version above
+void PPCMissingFunction(uint32_t guestAddress)
+{
+    LOGFN_ERROR("CRASH: indirect call to guest 0x{:08X}, which was not recompiled as a function", guestAddress);
+    LogGuestState();
+    os::logger::Flush();
+    _exit(7);
 }
 
 #endif

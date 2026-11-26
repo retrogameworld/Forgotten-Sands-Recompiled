@@ -160,3 +160,96 @@ PPC_FUNC(sub_82A10030)
         t_n = 0; t_sum = 0; t_max = 0; t_logAt = now;
     }
 }
+
+// Step 37 (the tester's Odin crash, and mine: the game's audio processing thread read a null XMA context in
+// sub_82D01748, "output samples ready in this voice's XMA ring"): the voice's entry no longer had a context (the
+// voice was being torn down by another thread while this pass still had it in its list). On the console that
+// window practically never opens; on the phone it did. With no context the ring is simply reported empty
+// (0 samples ready) - the voice gets no more data and goes on to its end. FS_NO_XMA_NULL_GUARD=1: off.
+PPC_FUNC_IMPL(__imp__sub_82D01748);
+PPC_FUNC(sub_82D01748)
+{
+    static const bool s_off = getenv("FS_NO_XMA_NULL_GUARD") != nullptr;
+    if (!s_off)
+    {
+        auto load32 = [&](uint32_t a) { return uint32_t(*reinterpret_cast<be<uint32_t>*>(base + a)); };
+        const uint32_t obj = ctx.r3.u32;
+        const bool localCopy = obj != 0 && (load32(obj + 4) & 0x20000) != 0; // rlwinm. r11,r11,0,14,14
+        const uint32_t entries = obj ? load32(obj + 8) : 0;
+        if (obj == 0 || entries == 0 || (!localCopy && load32(entries + ctx.r4.u32 * 96 + 64) == 0))
+        {
+            static std::atomic<int> s_n{0};
+            if (s_n++ < 20)
+                LOGFN("[audio] XMA voice 0x{:08X} entry {} has no context any more (being torn down): 0 samples ready", obj, ctx.r4.u32);
+            ctx.r3.u64 = 0;
+            return;
+        }
+    }
+    __imp__sub_82D01748(ctx, base);
+}
+
+// Step 37 diag: who tears a voice's XMA contexts down (sub_82D01688: releases each entry's context and zeroes it),
+// on which thread, and how soon after the voice was started. FS_LOG_XMA_TEARDOWN=1.
+PPC_FUNC_IMPL(__imp__sub_82D01688);
+PPC_FUNC(sub_82D01688)
+{
+    static const bool s_log = getenv("FS_LOG_XMA_TEARDOWN") != nullptr;
+    if (s_log)
+    {
+        extern std::string CurrentGuestCallChain(int maxFrames);
+        static std::atomic<int> s_n{0};
+        if (s_n++ < 200)
+            LOGFN("[audio] XMA teardown of 0x{:08X} on r13 0x{:08X} |{}", ctx.r3.u32, ctx.r13.u32, CurrentGuestCallChain(10));
+    }
+    __imp__sub_82D01688(ctx, base);
+}
+
+// Step 37: the same guard for sub_82D01700 ("is this entry's XMA context idle?", 1 = idle), which read the context
+// of the same torn-down voice right after sub_82D01748 (Odin crash, run odin73_6). No context = idle.
+PPC_FUNC_IMPL(__imp__sub_82D01700);
+PPC_FUNC(sub_82D01700)
+{
+    static const bool s_off = getenv("FS_NO_XMA_NULL_GUARD") != nullptr;
+    if (!s_off)
+    {
+        auto load32 = [&](uint32_t a) { return uint32_t(*reinterpret_cast<be<uint32_t>*>(base + a)); };
+        const uint32_t obj = ctx.r3.u32;
+        const bool localCopy = obj != 0 && (load32(obj + 4) & 0x20000) != 0;
+        const uint32_t entries = obj ? load32(obj + 8) : 0;
+        if (obj == 0 || entries == 0 || (!localCopy && load32(entries + ctx.r4.u32 * 96 + 64) == 0))
+        {
+            static std::atomic<int> s_n{0};
+            if (s_n++ < 20)
+                LOGFN("[audio] XMA voice 0x{:08X} entry {} has no context any more (being torn down): reported idle", obj, ctx.r4.u32);
+            ctx.r3.u64 = 1;
+            return;
+        }
+    }
+    __imp__sub_82D01700(ctx, base);
+}
+
+// Step 37 diag (PC + Odin crash in sub_8249F180, a write to guest 0x5 while putting a finished request back on its
+// manager's free list - the list's links were broken): is a request released twice? The release sets the state
+// word (+40) to 0; a request whose state is already 0 when it is released again is logged with the caller chain.
+// FS_LOG_REQ_RELEASE=1.
+PPC_FUNC_IMPL(__imp__sub_8249F180);
+PPC_FUNC(sub_8249F180)
+{
+    static const bool s_log = getenv("FS_LOG_REQ_RELEASE") != nullptr;
+    if (s_log)
+    {
+        auto load32 = [&](uint32_t a) { return uint32_t(*reinterpret_cast<be<uint32_t>*>(base + a)); };
+        const uint32_t item = ctx.r4.u32, mgr = ctx.r3.u32;
+        static std::atomic<uint64_t> s_calls{0};
+        static std::atomic<int> s_logged{0};
+        s_calls++;
+        const uint32_t state = item ? load32(item + 40) : 0xFFFFFFFF;
+        if (item && state == 0 && s_logged++ < 40)
+        {
+            extern std::string CurrentGuestCallChain(int maxFrames);
+            LOGFN("[req] request 0x{:08X} of 0x{:08X} released again (state 0, links {:08X} {:08X}, release #{}) r13 0x{:08X} |{}", item, mgr,
+                load32(item), load32(item + 4), s_calls.load(), ctx.r13.u32, CurrentGuestCallChain(12));
+        }
+    }
+    __imp__sub_8249F180(ctx, base);
+}

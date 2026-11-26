@@ -20,6 +20,20 @@ static void OutputFrame(const float* planar);
 static SDL_AudioDeviceID g_audioDevice{};
 static bool g_downMixToStereo;
 
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#include <unistd.h>
+// Step 37: gap counters of our SDL (src/audio/SDL_audio.c, aaudio/SDL_aaudio.c), shown in the 5 s [audio] line:
+// how often SDL's thread found less sound queued than it needed (the rest played as silence = a gap), the AAudio
+// stream's own underruns, its buffer, and how often SDL had to rebuild the stream.
+extern "C" int SDL_FS_QueueShortfalls;
+extern "C" Uint64 SDL_FS_QueueShortBytes;
+extern "C" int SDL_FS_AAudioRebuilds;
+extern "C" int SDL_FS_AAudioInfo(int* xruns, int* bufferFrames, int* burstFrames);
+#endif
+// Step 37: the audio thread's worst wake-up delay and the lowest queue it saw (both since the last [audio] line)
+static std::atomic<double> g_statMaxLateMs{0.0}, g_statMinQueuedMs{1e9};
+
 static void CreateAudioDevice()
 {
     if (g_audioDevice != NULL)
@@ -92,6 +106,15 @@ static void AudioThread()
     // Step 35b: the game's sound engine runs in this thread's callbacks; under CPU load it was preempted and the
     // device ran dry (see the clock lock below).
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#elif defined(__ANDROID__)
+    // Step 37: the same on Android (the tester: sound glitches on the Odin while the game's 6 busy threads fill the CPU):
+    // Android's audio priority (THREAD_PRIORITY_URGENT_AUDIO = nice -19, allowed for apps). FS_AUDIO_NICE=<n> for tests.
+    {
+        const char* n = getenv("FS_AUDIO_NICE");
+        const int nice = n ? atoi(n) : -19;
+        const int r = setpriority(PRIO_PROCESS, gettid(), nice);
+        LOGFN("[audio] sound thread priority nice {}: {}", nice, r == 0 ? "ok" : strerror(errno));
+    }
 #endif
     // Step 35b (the tester: sounds drift out of sync - the first explosion fine, the second late): every time the device
     // ran dry it played silence and the whole sound timeline moved later, for good (the tester's log: 80 ms per 30 s).
@@ -102,10 +125,25 @@ static void AudioThread()
     uint64_t framesMade = 0, framesSkipped = 0;
     auto lastSkipLog = std::chrono::steady_clock::now();
 
+    auto expectedWake = std::chrono::steady_clock::time_point{};
     while (!g_audioThreadShouldExit)
     {
         uint32_t queuedAudioSize = SDL_GetQueuedAudioSize(g_audioDevice);
+        if (g_clientCallback)
+        {
+            if (expectedWake != std::chrono::steady_clock::time_point{})
+            {
+                const double late = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - expectedWake).count();
+                if (late > g_statMaxLateMs.load(std::memory_order_relaxed)) g_statMaxLateMs.store(late, std::memory_order_relaxed);
+            }
+            const double qms = 1000.0 * queuedAudioSize / (double(XAUDIO_SAMPLES_HZ) * sizeof(float) * channels);
+            if (qms < g_statMinQueuedMs.load(std::memory_order_relaxed)) g_statMinQueuedMs.store(qms, std::memory_order_relaxed);
+        }
+#ifdef __ANDROID__
+        constexpr size_t MAX_LATENCY = 16;
+#else
         constexpr size_t MAX_LATENCY = 10;
+#endif
         const size_t callbackAudioSize = channels * XAUDIO_NUM_SAMPLES * sizeof(float);
 
         // Step 12c: log when the device ran dry (an audible gap / click) and slow game audio callbacks
@@ -125,7 +163,13 @@ static void AudioThread()
         // Step 12c: keep a few frames queued (about 21 ms). Before, one frame was made per wake-up, so the
         // queue sat at 0-1 frames and every late wake-up left the device without sound: ~30 tiny gaps
         // a second, heard as a repeating click (the tester, most audible on quiet screens like Exit to Title).
+#ifdef __ANDROID__
+        // Step 37: AAudio (normal mode) takes the queue in larger bursts: keep about 64 ms queued (with 4 frames the
+        // queue ran empty 13 times a second on the Odin)
+        constexpr size_t TARGET_FRAMES = 4; // (12 while SDL dropped what did not fit; with blocking writes 4 is enough)
+#else
         constexpr size_t TARGET_FRAMES = 4;
+#endif
         // Frames the device should have played by now (real time) vs frames it really got.
         size_t skip = 0;
         if (!s_noClockLock && clockStart != std::chrono::steady_clock::time_point{} && g_clientCallback)
@@ -179,6 +223,7 @@ static void AudioThread()
         constexpr auto INTERVAL = 1000000000ns * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ;
         auto next = now + (INTERVAL - now.time_since_epoch() % INTERVAL);
 
+        expectedWake = next;
         std::this_thread::sleep_for(std::chrono::floor<std::chrono::milliseconds>(next - now));
 
         while (std::chrono::steady_clock::now() < next)
@@ -305,7 +350,27 @@ static void CaptureFrame(const float* floatSamples)
     {
         const uint32_t queued = g_audioDevice ? SDL_GetQueuedAudioSize(g_audioDevice) : 0;
         const double queuedMs = 1000.0 * queued / (double(XAUDIO_SAMPLES_HZ) * sizeof(float) * (g_downMixToStereo ? 2 : XAUDIO_NUM_CHANNELS));
-        LOGFN("[audio] {:.0f} s: peak {:.3f}, non-silent frames {} of 940, queued {:.1f} ms", frames * double(XAUDIO_NUM_SAMPLES) / XAUDIO_SAMPLES_HZ, peak, nonSilentFrames, queuedMs);
+        LOGFN("[audio] {:.0f} s: peak {:.3f}, non-silent frames {} of 940, queued {:.1f} ms (lowest {:.1f}), sound thread late up to {:.1f} ms",
+            frames * double(XAUDIO_NUM_SAMPLES) / XAUDIO_SAMPLES_HZ, peak, nonSilentFrames, queuedMs, g_statMinQueuedMs.load(), g_statMaxLateMs.load());
+        g_statMinQueuedMs = 1e9;
+        g_statMaxLateMs = 0.0;
+#ifdef __ANDROID__
+        {
+            static int lastShort = 0, lastXruns = 0;
+            static Uint64 lastShortBytes = 0;
+            int xruns = 0, buffer = 0, burst = 0;
+            const bool info = SDL_FS_AAudioInfo(&xruns, &buffer, &burst) != 0;
+            const int shortNow = SDL_FS_QueueShortfalls;
+            const Uint64 shortBytes = SDL_FS_QueueShortBytes;
+            const double bytesPerMs = double(XAUDIO_SAMPLES_HZ) * sizeof(float) * (g_downMixToStereo ? 2 : XAUDIO_NUM_CHANNELS) / 1000.0;
+            LOGFN("[audio] gaps in the last 5 s: {} (SDL queue short, {:.1f} ms silence), AAudio underruns {}{}; buffer {} frames ({:.1f} ms), burst {}, stream rebuilds {}",
+                shortNow - lastShort, double(shortBytes - lastShortBytes) / bytesPerMs, info ? xruns - lastXruns : -1, info ? "" : " (no stream)",
+                buffer, buffer * 1000.0 / XAUDIO_SAMPLES_HZ, burst, SDL_FS_AAudioRebuilds);
+            lastShort = shortNow;
+            lastShortBytes = shortBytes;
+            if (info) lastXruns = xruns;
+        }
+#endif
         peak = 0.0f;
         nonSilentFrames = 0;
     }

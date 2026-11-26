@@ -25,16 +25,140 @@
 std::atomic<uint32_t> g_signalGeneration;
 std::atomic<uint32_t> g_multiWaiters;
 
+// Step 37 (Android): wait on / wake a 32-bit word the way WaitOnAddress / WakeByAddress do on Windows. The first
+// Android build slept 1 ms per critical-section wait and per finite wait here: the game ran at 34 fps instead of 60.
+#ifndef _WIN32
+#include <linux/futex.h>
+#include <sys/syscall.h>
+// Step 37 (Odin profile: the game's job threads spent ~16% of their time in NtSetEvent, every set / every critical
+// section leave was a futex system call even with nobody waiting): waiters are counted in a small table hashed by
+// address, and a wake only goes to the kernel when someone may be waiting there. Dekker pattern: the waiter counts
+// itself in, full fence, then the kernel compares the word; the waker changes the word, full fence, then reads the
+// count - one of the two always sees the other. FS_ALWAYS_WAKE=1 = a system call for every wake (as before).
+static std::atomic<uint32_t> g_addressWaiters[1024];
+static std::atomic<uint32_t>& AddressWaiters(const void* addr)
+{
+    return g_addressWaiters[(uint32_t(uintptr_t(addr) >> 2) * 2654435761u) >> 22];
+}
+static bool AddressMayHaveWaiters(const void* addr)
+{
+    static const bool s_always = getenv("FS_ALWAYS_WAKE") != nullptr;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    return s_always || AddressWaiters(addr).load(std::memory_order_relaxed) != 0;
+}
+static void AddressWait(const void* addr, uint32_t expected, uint32_t ms)
+{
+    timespec ts{ time_t(ms / 1000), long(ms % 1000) * 1000000L };
+    auto& waiters = AddressWaiters(addr);
+    waiters.fetch_add(1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expected, ms == 0xFFFFFFFFu ? nullptr : &ts, nullptr, 0);
+    waiters.fetch_sub(1, std::memory_order_relaxed);
+}
+static void AddressWakeAll(const void* addr)
+{
+    if (AddressMayHaveWaiters(addr))
+        syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, INT32_MAX, nullptr, nullptr, 0);
+}
+static void AddressWakeOne(const void* addr)
+{
+    if (AddressMayHaveWaiters(addr))
+        syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+}
+#endif
+
+// ---------------------------------------------------------------------------------------
+// Step 37: the console's one-core priority rule (crashes on PC and Odin in the game's sound objects, right after
+// sounds start; the PC rate was ~1 in 8 level runs since the first builds).
+// The game puts its XAudio processing thread (sub_82D29FD8, priority 16) on hardware thread 5 together with other
+// threads, and those raise their own priority to 16 for a moment around work on the same sound data
+// (KeSetBasePriorityThread(current, 16) ... (current, 0), hundreds of times). On the console two threads of
+// priority 16 on one hardware thread never run at the same time; here every thread has its own host thread, so
+// those sections ran right in the middle of the processing pass. Now threads of priority >= 16 on the same
+// hardware thread take that core's gate while they run and give it back whenever they block (waits, sleeps,
+// critical sections, yields). FS_NO_CORE_GATE=1: off.
+static std::mutex g_coreGates[8];
+static thread_local int t_coreGroup = -1;
+static thread_local bool t_coreHigh = false, t_coreHolding = false;
+static std::atomic<uint64_t> g_coreGateTakes[8];
+static bool CoreGateOn() { static const bool s_on = getenv("FS_CORE_GATE") != nullptr; return s_on; } // opt-in: did not help (3 crashes in 8 PC runs)
+static int CoreGroupOf(uint32_t affinity)
+{
+    if (affinity == 0 || (affinity & (affinity - 1)) != 0) return -1; // none or several hardware threads
+    int g = 0; while (!(affinity & 1)) { affinity >>= 1; g++; }
+    return g < 8 ? g : -1;
+}
+static void CoreGateAcquire()
+{
+    if (!CoreGateOn() || !t_coreHigh || t_coreGroup < 0 || t_coreHolding) return;
+    if (!g_coreGates[t_coreGroup].try_lock())
+    {
+        static std::atomic<uint32_t> s_waits{0};
+        const uint32_t n = ++s_waits;
+        if (n <= 5 || (n & (n - 1)) == 0)
+            LOGFN("[coregate] wait #{} on core {} (r13 0x{:08X})", n, t_coreGroup, g_ppcContext ? g_ppcContext->r13.u32 : 0);
+        g_coreGates[t_coreGroup].lock();
+    }
+    t_coreHolding = true;
+    g_coreGateTakes[t_coreGroup]++;
+}
+static void CoreGateRelease()
+{
+    if (!t_coreHolding) return;
+    t_coreHolding = false;
+    g_coreGates[t_coreGroup].unlock();
+}
+// Around anything that blocks: the gate goes to the core's other high-priority thread meanwhile.
+struct CoreGateYield
+{
+    bool held;
+    CoreGateYield() : held(t_coreHolding) { if (held) CoreGateRelease(); }
+    ~CoreGateYield() { if (held) CoreGateAcquire(); }
+};
+static thread_local int t_corePriority = 0;
+void CoreGateThreadStart(uint32_t affinity, int priority)
+{
+    t_coreGroup = CoreGroupOf(affinity);
+    t_corePriority = priority;
+    t_coreHigh = priority >= 16;
+    CoreGateAcquire();
+}
+void CoreGateThreadEnd() { CoreGateRelease(); }
+int CoreGateCurrentPriority(int set)
+{
+    const int previous = t_corePriority;
+    t_corePriority = set;
+    t_coreHigh = set >= 16;
+    if (t_coreHigh) CoreGateAcquire(); else CoreGateRelease();
+    return previous;
+}
+void CoreGateCurrentAffinity(uint32_t affinity)
+{
+    const int g = CoreGroupOf(affinity);
+    if (g == t_coreGroup) return;
+    CoreGateRelease();
+    t_coreGroup = g;
+    CoreGateAcquire();
+}
+
 void NotifySignal()
 {
     g_signalGeneration.fetch_add(1);
+#ifdef _WIN32
     g_signalGeneration.notify_all();
+#else
+    AddressWakeAll(&g_signalGeneration); // (nothing waits with std::atomic::wait off Windows)
+#endif
 }
 
 void NotifySignal(std::atomic<uint32_t>& objectGeneration)
 {
     objectGeneration.fetch_add(1);
+#ifdef _WIN32
     objectGeneration.notify_all();
+#else
+    AddressWakeAll(&objectGeneration);
+#endif
     if (g_multiWaiters.load() != 0) // seq_cst: pairs with the increment in WaitForObjects/NtWaitForMultipleObjectsEx
         NotifySignal();
 }
@@ -48,7 +172,8 @@ static void WaitGenerationFor(std::atomic<uint32_t>& notifier, uint32_t generati
     static const long long s_poll = [] { const char* e = getenv("FS_WAIT_POLL_MS"); return e ? std::max(1ll, atoll(e)) : 1000ll; }();
     WaitOnAddress(&notifier, &generation, sizeof(generation), DWORD(std::clamp<long long>(ms, 1, s_poll)));
 #else
-    std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(std::chrono::milliseconds(1), left));
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(left).count();
+    AddressWait(&notifier, generation, uint32_t(std::clamp<long long>(ms, 1, 1000)));
 #endif
 }
 
@@ -76,9 +201,14 @@ uint32_t WaitWithTimeout(const std::function<bool()>& tryAcquire, std::atomic<ui
 
         if (timeoutMs == X_INFINITE)
         {
+            CoreGateYield gate;
             static const bool s_pollInf = getenv("FS_WAIT_POLL_MS") != nullptr;
             if (s_pollInf) WaitGenerationFor(notifier, generation, std::chrono::seconds(1));
+#ifdef _WIN32
             else notifier.wait(generation);
+#else
+            else AddressWait(&notifier, generation, 1000); // (re-checked after a second, like the Windows poll)
+#endif
             continue;
         }
 
@@ -107,6 +237,7 @@ uint32_t WaitWithTimeout(const std::function<bool()>& tryAcquire, std::atomic<ui
             return X_STATUS_TIMEOUT;
         }
 
+        CoreGateYield gate;
         WaitGenerationFor(notifier, generation, deadline - now);
     }
 }
@@ -367,6 +498,7 @@ uint32_t NtWaitForMultipleObjectsEx(uint32_t Count, be<uint32_t>* Handles, uint3
 
 uint32_t NtYieldExecution()
 {
+    CoreGateYield gate;
     std::this_thread::yield();
     return X_STATUS_SUCCESS;
 }
@@ -445,6 +577,7 @@ uint32_t KeDelayExecutionThread(uint32_t WaitMode, uint32_t Alertable, be<int64_
     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
     Perf::Add(Perf::GuestSleep, uint64_t(timeout == X_INFINITE ? 1000 : timeout) * 1000000ull);
 
+    CoreGateYield gate;
     if (timeout == 0)
         std::this_thread::yield();
     else
@@ -505,6 +638,15 @@ static GuestThreadHandle* ThreadFromHandle(uint32_t handle)
 
 uint32_t KeSetBasePriorityThread(uint32_t thread, int32_t priority)
 {
+    if (thread == CURRENT_THREAD_HANDLE)
+    {
+        extern int CoreGateCurrentPriority(int set);
+        return uint32_t(CoreGateCurrentPriority(priority));
+    }
+    {
+        static std::atomic<int> s_n{0};
+        if (s_n++ < 60) { auto* t = ThreadFromHandle(thread); LOGFN("[thread] KeSetBasePriorityThread(handle 0x{:08X}, {}) start 0x{:08X} ctx 0x{:08X}", thread, priority, t ? t->params.function : 0, t ? t->params.value : 0); }
+    }
     auto* hThread = ThreadFromHandle(thread);
     int previous = hThread ? hThread->priority : 0;
     if (hThread)
@@ -520,6 +662,26 @@ uint32_t KeQueryBasePriorityThread(uint32_t thread)
 
 uint32_t KeSetAffinityThread(uint32_t Thread, uint32_t Affinity, be<uint32_t>* lpPreviousAffinity)
 {
+    extern bool PcrAffinityOn();
+    extern int ProcessorOfAffinity(uint32_t affinity);
+    const int processor = PcrAffinityOn() ? ProcessorOfAffinity(Affinity) : -1;
+    if (Thread == CURRENT_THREAD_HANDLE)
+    {
+        extern void CoreGateCurrentAffinity(uint32_t affinity);
+        CoreGateCurrentAffinity(Affinity);
+        if (processor >= 0)
+            *((uint8_t*)g_memory.Translate(g_ppcContext->r13.u32) + 0x10C) = uint8_t(processor);
+    }
+    else if (auto* t = ThreadFromHandle(Thread))
+    {
+        t->affinity = Affinity;
+        if (const uint32_t pcr = t->pcr; pcr != 0 && processor >= 0)
+            *((uint8_t*)g_memory.Translate(pcr) + 0x10C) = uint8_t(processor);
+    }
+    {
+        static std::atomic<int> s_n{0};
+        if (s_n++ < 60) { auto* t = ThreadFromHandle(Thread); LOGFN("[thread] KeSetAffinityThread(handle 0x{:08X}, affinity 0x{:X}) start 0x{:08X} ctx 0x{:08X}", Thread, Affinity, t ? t->params.function : 0, t ? t->params.value : 0); }
+    }
     if (lpPreviousAffinity)
         *lpPreviousAffinity = 2;
 
@@ -688,7 +850,11 @@ void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
 
     std::atomic_ref owningThread(cs->OwningThread);
     owningThread.store(0);
+#ifdef _WIN32
     owningThread.notify_one();
+#else
+    AddressWakeOne(&cs->OwningThread);
+#endif
 }
 
 void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
@@ -710,6 +876,7 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
             return;
         }
 
+        CoreGateYield gate; // Step 37: give the core's gate away while blocked
         // Step 35 diag: report a wait of more than 3 s (deadlock hunting) once, then keep waiting.
         if (!logged)
         {
@@ -721,10 +888,18 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
                 extern std::string CurrentGuestCallChain(int maxFrames);
                 LOGFN("[cs] r13 0x{:08X} waits >3 s for 0x{:08X} owned by 0x{:08X} (recursion {}) |{}", thisThread, uint32_t((uint8_t*)cs - g_memory.base), previousOwner, cs->RecursionCount, CurrentGuestCallChain(40));
             }
+#ifdef _WIN32
             WaitOnAddress(&cs->OwningThread, &previousOwner, sizeof(previousOwner), 1000);
+#else
+            AddressWait(&cs->OwningThread, previousOwner, 1000);
+#endif
         }
         else
+#ifdef _WIN32
             owningThread.wait(previousOwner);
+#else
+            AddressWait(&cs->OwningThread, previousOwner, 1000);
+#endif
     }
 }
 
@@ -769,6 +944,7 @@ static void SpinAcquire(uint32_t* spinLock)
         uint32_t expected = 0;
         if (spinLockRef.compare_exchange_weak(expected, g_ppcContext->r13.u32))
             break;
+        CoreGateYield gate;
         std::this_thread::yield();
     }
 }

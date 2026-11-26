@@ -5,6 +5,9 @@
 #include <hid/hid.h>
 #include <hid/input_script.h>
 #include <os/logger.h>
+#include <gpu/video.h>
+
+extern bool g_inputMarkerQuery; // video.cpp (FS_TEST_INPUT_MARKER)
 #include <kernel/xdm.h>
 
 #define TRANSLATE_INPUT(S, X) SDL_GameControllerGetButton(controller, S) << FirstBitLow(X)
@@ -136,16 +139,69 @@ public:
         if (!CanPoll())
             return;
 
+        // Step 37: the game sets the rumble every frame, mostly to the same values. On Android each call is a call
+        // into Java and the vibrator service from the game's thread (the tester: the game lagged and the sound glitched on
+        // the Odin); now only changes go out, and the same values again every 2 s (the rumble times out after 5 s).
+        // FS_NO_RUMBLE_DEDUPE=1 = every call as before.
+        static const bool s_noDedupe = getenv("FS_NO_RUMBLE_DEDUPE") != nullptr;
+        const uint64_t now = SDL_GetTicks64();
+        const bool same = vibration.wLeftMotorSpeed == this->vibration.wLeftMotorSpeed && vibration.wRightMotorSpeed == this->vibration.wRightMotorSpeed;
         this->vibration = vibration;
-
+        rumbleStats.calls++;
+        if (same && now - lastRumbleSent < 2000 && lastRumbleSent != 0 && !s_noDedupe)
+            return;
+        lastRumbleSent = now;
+        const uint64_t t0 = SDL_GetPerformanceCounter();
         SDL_GameControllerRumble(controller, vibration.wLeftMotorSpeed, vibration.wRightMotorSpeed, VIBRATION_TIMEOUT_MS);
+        rumbleStats.sent++;
+        rumbleStats.ms += double(SDL_GetPerformanceCounter() - t0) * 1000.0 / double(SDL_GetPerformanceFrequency());
+        if (now - rumbleStats.lastLog >= 5000)
+        {
+            if (rumbleStats.lastLog != 0)
+                LOGFN("[hid] rumble: {} calls from the game, {} sent to the controller, {:.1f} ms spent (last 5 s)", rumbleStats.calls, rumbleStats.sent, rumbleStats.ms);
+            rumbleStats = {};
+            rumbleStats.lastLog = now;
+        }
     }
+
+    uint64_t lastRumbleSent = 0;
+    struct { uint32_t calls = 0, sent = 0; double ms = 0.0; uint64_t lastLog = 0; } rumbleStats;
 
     void SetLED(const uint8_t r, const uint8_t g, const uint8_t b) const
     {
         SDL_GameControllerSetLED(controller, r, g, b);
     }
 };
+
+#ifdef __ANDROID__
+#include <jni.h>
+// Step 37 (the tester: "add support for touch screen controls"): the Android app's on-screen pad (TouchPadView) sends its
+// state here; it is merged into pad 0 like a second controller. Buttons are XInput bits, 0x10000 / 0x20000 = left /
+// right trigger; sticks are -1..1 in screen directions (y down).
+static std::atomic<uint32_t> g_touchButtons{0};
+// a quick tap (finger down and up within a few ms) is still reported for at least 60 ms, so the game sees it
+static std::atomic<uint64_t> g_touchPressMs[18];
+static uint64_t TouchNowMs() { return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+static std::atomic<int32_t> g_touchLeft{0}, g_touchRight{0}; // x in the low 16 bits, y in the high 16 bits (XInput units)
+static int32_t PackStick(float x, float y)
+{
+    const int16_t ix = int16_t(std::clamp(x, -1.0f, 1.0f) * 32767.0f);
+    const int16_t iy = int16_t(std::clamp(-y, -1.0f, 1.0f) * 32767.0f); // XInput: up is positive
+    return int32_t(uint32_t(uint16_t(ix)) | (uint32_t(uint16_t(iy)) << 16));
+}
+extern "C" JNIEXPORT void JNICALL Java_com_fsrecomp_forgottensands_TouchPadView_nativeTouchPad(JNIEnv*, jclass, jint buttons, jfloat lx, jfloat ly, jfloat rx, jfloat ry)
+{
+    const uint32_t newly = uint32_t(buttons) & ~g_touchButtons.load();
+    const uint64_t now = TouchNowMs();
+    for (int i = 0; i < 18; i++) if (newly & (1u << i)) g_touchPressMs[i] = now;
+    g_touchButtons = uint32_t(buttons);
+    g_touchLeft = PackStick(lx, ly);
+    g_touchRight = PackStick(rx, ry);
+    static std::atomic<bool> s_logged{false};
+    if (buttons != 0 && !s_logged.exchange(true))
+        LOGN("[hid] on-screen touch pad in use");
+}
+#endif
 
 std::array<Controller, 4> g_controllers;
 Controller* g_activeController;
@@ -329,7 +385,9 @@ void hid::Init()
 
     // FS_MUTE (Claude's automated test runs): never open the physical controller, so a test running in the
     // background cannot take the tester's pad away from his own game window (scripted input still works).
-    if (const char* m = getenv("FS_MUTE"); m && *m && *m != '0')
+    // Step 37: FS_TEST_PAD=1 (Odin test runs) opens the device's own controller anyway, driven by the test with
+    // sendevent; rumble stays off (FS_MUTE).
+    if (const char* m = getenv("FS_MUTE"); m && *m && *m != '0' && getenv("FS_TEST_PAD") == nullptr)
     {
         LOGN("[hid] test run (FS_MUTE): physical controllers are not opened");
         return;
@@ -356,15 +414,62 @@ uint32_t hid::GetState(uint32_t dwUserIndex, XAMINPUT_STATE* pState)
     if (dwUserIndex != 0)
         return ERROR_DEVICE_NOT_CONNECTED;
 
+    static const bool s_logTimes = getenv("FS_LOG_INPUT_TIMES") != nullptr;
+    const auto pollStart = s_logTimes ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     if (g_activeController)
     {
         g_activeController->Poll();
         g_activeController->PollAxis();
         pState->Gamepad = g_activeController->state;
     }
+    if (s_logTimes && !::g_inputMarkerQuery)
+    {
+        // how long reading the pad takes and how often the game asks (Step 37, controller lag)
+        static std::atomic<uint64_t> s_calls{0}, s_us{0}, s_maxUs{0};
+        static auto s_since = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - pollStart).count());
+        s_us += us; if (us > s_maxUs) s_maxUs = us;
+        if (++s_calls % 600 == 0)
+        {
+            const double secs = std::chrono::duration<double>(now - s_since).count();
+            LOGFN("[inputtime] pad read by the game {:.0f} times/s, {:.3f} ms each on average, slowest {:.2f} ms (thread {})", 600 / secs, s_us / 600.0 / 1000.0, s_maxUs / 1000.0, (unsigned long)std::hash<std::thread::id>()(std::this_thread::get_id()) % 100000);
+            s_us = 0; s_maxUs = 0; s_since = now;
+        }
+    }
 
+#ifdef __ANDROID__
+    {
+        uint32_t tb = g_touchButtons.load();
+        const uint64_t now = TouchNowMs();
+        for (int i = 0; i < 18; i++) { const uint64_t t = g_touchPressMs[i].load(); if (t != 0 && now - t < 60) tb |= 1u << i; }
+        const int32_t tl = g_touchLeft.load(), tr = g_touchRight.load();
+        pState->Gamepad.wButtons |= uint16_t(tb & 0xFFFF);
+        if (tb & 0x10000) pState->Gamepad.bLeftTrigger = 255;
+        if (tb & 0x20000) pState->Gamepad.bRightTrigger = 255;
+        if (tl != 0) { pState->Gamepad.sThumbLX = int16_t(tl & 0xFFFF); pState->Gamepad.sThumbLY = int16_t(uint32_t(tl) >> 16); }
+        if (tr != 0) { pState->Gamepad.sThumbRX = int16_t(tr & 0xFFFF); pState->Gamepad.sThumbRY = int16_t(uint32_t(tr) >> 16); }
+    }
+#endif
     InputScript::Apply(pState->Gamepad);
 
+    // Step 37 diag (the tester: "half a second of controller lag"): FS_LOG_INPUT_TIMES=1 logs the CLOCK_BOOTTIME ms at which
+    // the game first sees a button change (compare with /proc/uptime at the press).
+    if (static const bool s_log = getenv("FS_LOG_INPUT_TIMES") != nullptr; s_log && !::g_inputMarkerQuery)
+    {
+        static uint16_t s_prev = 0;
+        if (pState->Gamepad.wButtons != s_prev)
+        {
+#ifdef __ANDROID__
+            timespec ts; clock_gettime(CLOCK_BOOTTIME, &ts);
+            const double ms = ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+#else
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
+            LOGFN("[inputtime] buttons 0x{:04X} -> 0x{:04X} seen by the game at boottime {:.1f} ms (frame {})", s_prev, pState->Gamepad.wButtons, ms, Video::GetPresentedFrameCount());
+            s_prev = pState->Gamepad.wButtons;
+        }
+    }
     return ERROR_SUCCESS;
 }
 

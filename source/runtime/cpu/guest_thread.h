@@ -36,6 +36,8 @@ struct GuestThreadHandle : KernelObject
     std::atomic<bool> finished{ false };
     uint32_t exitCode = 0;
     int priority = 0;
+    std::atomic<uint32_t> pcr{0}; // Step 37: guest address of the running thread's PCR (processor number at +0x10C)
+    uint32_t affinity = 0; // Step 37: KeSetAffinityThread before the thread started (core gate, imports.cpp)
     std::thread thread;
 
     GuestThreadHandle(const GuestThreadParams& params);

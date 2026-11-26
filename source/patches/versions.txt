@@ -1,0 +1,6 @@
+Changes of this project to upstream repositories. Apply with: git -C <repository> apply <patch>
+
+XenonRecomp.diff   https://github.com/hedge-dev/XenonRecomp.git   commit ddd128bcca99fe8bfbb99bea583c972351fa6ace   (<project folder>\tools\XenonRecomp)
+XenosRecomp.diff   https://github.com/hedge-dev/XenosRecomp.git   commit 990d03b28a27b50277ee5d8d942e1c5f873869d1   (<project folder>\tools\XenosRecomp)
+plume.diff   https://github.com/renderbag/plume.git   commit 11926860e878e68626ea99ec88562ce2b8badc4f   (<project folder>\tools\UnleashedRecomp\thirdparty\plume)
+SDL.diff   https://github.com/libsdl-org/SDL.git   commit 1edaad17218d67b567c149badce9ef0fc67f65fa   (<project folder>\tools\UnleashedRecomp\thirdparty\SDL)

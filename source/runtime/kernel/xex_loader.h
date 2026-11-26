@@ -22,4 +22,8 @@ struct XexInfo
 extern XexInfo g_xex;
 
 bool XexLoadExecutable(const std::filesystem::path& path);
+// Step 37 (Android app icon, the tester: "with the game's official icon"): writes the title image of the player's own
+// game (the PNG in the XEX's title resource, an XDBF file: namespace 2, id 0x8000) to `out`. Nothing of the game
+// ships with the app; this is read from the player's disc after it is unpacked.
+bool XexWriteTitleImage(const std::filesystem::path& out);
 void KernelStartTimeStampUpdater();

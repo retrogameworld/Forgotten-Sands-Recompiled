@@ -18,7 +18,11 @@ set(BUILD_SHARED_LIBS OFF)
 
 set(FS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." CACHE PATH "Forgotten Sands recomp root")
 get_filename_component(FS_ROOT "${FS_ROOT}" ABSOLUTE)
-set(FS_PPC_DIR "${FS_ROOT}/builds/ppc")
+if (ANDROID)
+    set(FS_PPC_DIR "${FS_ROOT}/builds/ppc_arm") # Step 37: see src/ppc_lib/CMakeLists.txt
+else()
+    set(FS_PPC_DIR "${FS_ROOT}/builds/ppc")
+endif()
 set(UR_ROOT "${FS_ROOT}/tools/UnleashedRecomp")
 set(UR_THIRDPARTY "${UR_ROOT}/thirdparty")
 set(XR_ROOT "${FS_ROOT}/tools/XenonRecomp")
@@ -29,10 +33,16 @@ set(XR_THIRDPARTY "${XR_ROOT}/thirdparty")
 if (MSVC)
     add_compile_options("/clang:-ffile-prefix-map=${FS_ROOT}=.")
     add_link_options("/PDBALTPATH:%_PDB%")
+else()
+    add_compile_options("-ffile-prefix-map=${FS_ROOT}=.") # Step 37: the same for the Android build
 endif()
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|amd64")
     add_compile_options(-march=x86-64-v3) # Step 35 (was sandybridge)
+endif()
+if (ANDROID)
+    # Step 37: ARMv8.2 (LSE atomics - every phone CPU since 2018), full optimisation, no stack cookies
+    add_compile_options(-march=armv8.2-a -O3 -fno-stack-protector)
 endif()
 
 # ------------------------------------------------------------------------------------------
@@ -42,7 +52,11 @@ option(FS_BUILD_PPC "Build ForgottenSandsPPC as part of this project instead of 
 if (FS_BUILD_PPC)
     add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/ppc_lib" "${CMAKE_BINARY_DIR}/ppc_lib")
 else()
-    set(FS_PPC_LIB "${FS_ROOT}/builds/ppc_lib/ForgottenSandsPPC.lib")
+    if (ANDROID)
+        set(FS_PPC_LIB "${FS_ROOT}/builds/android_ppc/libForgottenSandsPPC.a") # Step 37: android\build_ppc.bat
+    else()
+        set(FS_PPC_LIB "${FS_ROOT}/builds/ppc_lib/ForgottenSandsPPC.lib")
+    endif()
     if (NOT EXISTS "${FS_PPC_LIB}")
         message(FATAL_ERROR "${FS_PPC_LIB} not found. Run src/ppc_lib/build.bat first or configure with -DFS_BUILD_PPC=ON.")
     endif()
@@ -70,7 +84,7 @@ target_compile_options(plume_vulkan PRIVATE -Wno-everything)
 if (WIN32)
     target_compile_definitions(plume_vulkan PUBLIC NOMINMAX)
 endif()
-if (ANDROID OR (CMAKE_SYSTEM_NAME MATCHES "Linux"))
+if (NOT ANDROID AND (CMAKE_SYSTEM_NAME MATCHES "Linux")) # Android: plume takes the ANativeWindow from SDL (video.cpp)
     target_compile_definitions(plume_vulkan PUBLIC SDL_VULKAN_ENABLED)
     target_link_libraries(plume_vulkan PUBLIC SDL2::SDL2-static)
 endif()
@@ -104,6 +118,10 @@ set(XS_DXC "${XS_THIRDPARTY}/dxc-bin")
 add_library(fs_shader_translator STATIC
     "${XS_ROOT}/XenosRecomp/shader_recompiler.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gpu/shader_translator.cpp")
+if (ANDROID)
+    # Step 37: the headers of the DXC that is built from source (the prebuilt dxc-bin's WinAdapter.h does not compile here)
+    target_include_directories(fs_shader_translator BEFORE PRIVATE "${FS_ROOT}/tools/dxc-src/include/dxc" "${FS_ROOT}/tools/dxc-src/include")
+endif()
 target_include_directories(fs_shader_translator PRIVATE
     "${XS_ROOT}/XenosRecomp"
     "${XS_DXC}/inc"
@@ -118,6 +136,15 @@ if (WIN32)
     target_compile_options(fs_shader_translator PRIVATE /EHsc)
     target_link_libraries(fs_shader_translator PUBLIC "${XS_DXC}/lib/x64/dxcompiler.lib")
     set(FS_DXC_DLL "${XS_DXC}/bin/x64/dxcompiler.dll")
+elseif (ANDROID)
+    # Step 37: DXC built for Android ARM64 from source (android\build_dxc.bat)
+    set(FS_DXC_ANDROID "${FS_ROOT}/builds/android_dxc/lib/libdxcompiler.so")
+    if (EXISTS "${FS_DXC_ANDROID}")
+        target_link_libraries(fs_shader_translator PUBLIC "${FS_DXC_ANDROID}")
+    else()
+        message(WARNING "${FS_DXC_ANDROID} not built yet: shaders cannot be translated")
+        target_compile_definitions(fs_shader_translator PRIVATE FS_NO_DXC)
+    endif()
 else()
     target_link_libraries(fs_shader_translator PUBLIC "${XS_DXC}/lib/x64/libdxcompiler.so")
 endif()
@@ -178,7 +205,13 @@ else()
     list(APPEND FS_RUNTIME_SOURCES "${RT}/os/linux/process_linux.cpp")
 endif()
 
-add_executable(ForgottenSandsRecomp ${FS_RUNTIME_SOURCES})
+if (ANDROID)
+    # Step 37: the Android app loads libmain.so and calls SDL_main (SDL's Java side, SDLActivity).
+    add_library(ForgottenSandsRecomp SHARED ${FS_RUNTIME_SOURCES})
+    set_target_properties(ForgottenSandsRecomp PROPERTIES OUTPUT_NAME main)
+else()
+    add_executable(ForgottenSandsRecomp ${FS_RUNTIME_SOURCES})
+endif()
 target_include_directories(ForgottenSandsRecomp PRIVATE
     "${RT}"
     "${XR_THIRDPARTY}/fmt/include"
@@ -221,6 +254,12 @@ if (WIN32)
     target_link_libraries(ForgottenSandsRecomp PRIVATE winmm Synchronization)
 else()
     target_compile_options(ForgottenSandsRecomp PRIVATE -ffp-model=strict)
+    # the same identical duplicate functions as /FORCE:MULTIPLE above
+    target_link_options(ForgottenSandsRecomp PRIVATE -Wl,--allow-multiple-definition)
+endif()
+if (ANDROID)
+    target_link_libraries(ForgottenSandsRecomp PRIVATE android log)
+    target_link_options(ForgottenSandsRecomp PRIVATE -Wl,-Bsymbolic) # FFmpeg's ARM64 assembly refers to its tables directly
 endif()
 
 target_link_libraries(ForgottenSandsRecomp PRIVATE
@@ -240,10 +279,18 @@ set_target_properties(ForgottenSandsRecomp PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 # FFmpeg (LGPL shared build, tools/ffmpeg) for XMA audio decoding (apu/xma.cpp).
+if (ANDROID)
+    # Step 37: a small static FFmpeg for Android ARM64 with only the decoders the game needs (android\build_ffmpeg.sh)
+    set(FS_FFMPEG "${FS_ROOT}/builds/android_ffmpeg")
+    target_include_directories(ForgottenSandsRecomp PRIVATE "${FS_FFMPEG}/include")
+    target_link_libraries(ForgottenSandsRecomp PRIVATE "${FS_FFMPEG}/lib/libavformat.a" "${FS_FFMPEG}/lib/libavcodec.a" "${FS_FFMPEG}/lib/libswresample.a" "${FS_FFMPEG}/lib/libavutil.a" m z)
+    set(FS_FFMPEG_DLLS "")
+else()
 set(FS_FFMPEG "${FS_ROOT}/tools/ffmpeg")
 target_include_directories(ForgottenSandsRecomp PRIVATE "${FS_FFMPEG}/include")
 target_link_libraries(ForgottenSandsRecomp PRIVATE "${FS_FFMPEG}/lib/avcodec.lib" "${FS_FFMPEG}/lib/avutil.lib" "${FS_FFMPEG}/lib/avformat.lib")
 file(GLOB FS_FFMPEG_DLLS "${FS_FFMPEG}/bin/*.dll")
+endif()
 foreach(dll ${FS_FFMPEG_DLLS})
     add_custom_command(TARGET ForgottenSandsRecomp POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "$<TARGET_FILE_DIR:ForgottenSandsRecomp>")
 endforeach()
