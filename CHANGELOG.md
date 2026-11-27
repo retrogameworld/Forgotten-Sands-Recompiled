@@ -2,6 +2,17 @@
 
 All releases of Forgotten Sands Recompiled (Windows PC). The newest version is at the top.
 
+## 1.2 (2026-11-27)
+
+- New: achievements. The game's 40 Xbox 360 achievements now unlock as you play. A notice with the achievement's icon,
+  name and gamerscore appears at the top of the screen for a few seconds. Story achievements you passed before this
+  version can unlock soon after you continue your save. Unlocks are kept in
+  `achievements\unlocked.txt` in your save folder, and the full list (names, descriptions, icons) is in
+  `achievements\list.json`. To reset them, set `reset_achievements = true` in `settings.toml` (clears them at the
+  next start, then turns back to `false`) or delete `unlocked.txt`. Your game saves are separate and not touched.
+- Removed: the "Uplay - Action completed" popup at the top right of the screen (left over from the game's Uplay
+  rewards, which no longer exist).
+
 ## 1.1 (2026-11-27)
 
 - Fixed: enemies did not attack and jars could not be broken in 1.0 (found through the Android version: the memory

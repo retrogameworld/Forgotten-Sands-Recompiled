@@ -277,11 +277,12 @@ uint32_t MmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t size, uint32_t prot
     if (s_logAllocs) LOGFN("[mem] MmAllocatePhysicalMemoryEx flags 0x{:X} size 0x{:X} protect 0x{:X} min 0x{:X} max 0x{:X} align 0x{:X}", flags, size, protect, minAddress, maxAddress, alignment);
     // Step 38e (GitHub #2 follow-up, 1.1: "the enemies do not attack, and the jars cannot be broken"; reproduced on the
     // PC in the first fight: the Prince took no damage): with the Step 38 allocator the game's blocks (8 MB / 2 MB / 64 KB
-    // large-page blocks) came back directly one after another. With unused room after each block (the old o1heap left
-    // plenty) the enemies attack again; no write past a block was ever seen (FS_PHYS_GUARD), so the game depends on its
-    // blocks not being contiguous. 4 KB of room after every block of the game (about 0.3 MB in all).
+    // large-page blocks) came back directly one after another, and the game reads past the end of its blocks (no write
+    // past any block was ever seen, FS_PHYS_GUARD up to 64 KB). The old o1heap left large unused room after them. With
+    // 4 KB of room the Odin then crashed at the level load (small blocks of ours sat a few KB after the game's); with
+    // 64 KB of zeroed room after every block of the game everything works (about 4 MB in all).
     // FS_PHYS_GAP=<bytes> changes it (0 = none).
-    static const uint32_t s_gap = [] { const char* e = getenv("FS_PHYS_GAP"); return e ? uint32_t(strtoul(e, nullptr, 0)) : 0x1000u; }();
+    static const uint32_t s_gap = [] { const char* e = getenv("FS_PHYS_GAP"); return e ? uint32_t(strtoul(e, nullptr, 0)) : 0x10000u; }();
     void* ptr = g_userHeap.AllocPhysical(size + s_gap, alignment);
     if (ptr == nullptr)
     {
@@ -289,7 +290,7 @@ uint32_t MmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t size, uint32_t prot
         return 0;
     }
 
-    memset(ptr, 0, size);
+    memset(ptr, 0, size + s_gap); // the room after the block reads as zeros too
     uint32_t address = g_memory.MapVirtual(ptr);
     static const bool ioTrace = getenv("FS_IO_TRACE") != nullptr;
     if (Config::Verbose || ioTrace)

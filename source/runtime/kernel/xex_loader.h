@@ -26,4 +26,5 @@ bool XexLoadExecutable(const std::filesystem::path& path);
 // game (the PNG in the XEX's title resource, an XDBF file: namespace 2, id 0x8000) to `out`. Nothing of the game
 // ships with the app; this is read from the player's disc after it is unpacked.
 bool XexWriteTitleImage(const std::filesystem::path& out);
+bool XexGetXdbf(const uint8_t** data, uint32_t* size); // Step 38f: achievements data
 void KernelStartTimeStampUpdater();

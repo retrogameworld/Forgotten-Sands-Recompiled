@@ -1,4 +1,5 @@
 #include <stdafx.h>
+#include "achievements.h"
 #include <deque>
 #ifndef LOG_FIRST
 #define LOG_FIRST(N, ...) do { static std::atomic<uint32_t> s_count; if (s_count.fetch_add(1) < (N)) LOGFN(__VA_ARGS__); } while (0)
@@ -263,6 +264,7 @@ struct XamEnumerator : KernelObject
     size_t position = 0;
     size_t perCall = 1;
     std::vector<uint8_t> extra; // XamCreateEnumeratorHandle private data (guest memory below)
+    bool achievements = false;  // Step 38f: XamUserCreateAchievementEnumerator (records + strings, see XamEnumerate)
     uint32_t extraGuest = 0;
 
     ~XamEnumerator() override
@@ -340,6 +342,62 @@ uint32_t XamEnumerate(uint32_t hEnum, uint32_t dwFlags, void* pvBuffer, uint32_t
         return X_ERROR_INVALID_PARAMETER;
 
     size_t returned = 0;
+    // Step 38f: achievements: XACHIEVEMENT_DETAILS records (0x24 bytes: id, label, description, unachieved text
+    // (guest pointers to UTF-16 strings, placed after the records in the same buffer), image id, gamerscore, unlock
+    // FILETIME, flags (the XDBF flags, | 0x20000 = achieved)).
+    if (e->achievements)
+    {
+        const auto list = Achievements::Details();
+        auto wide = [](const std::string& s) {
+            std::u16string w;
+            for (size_t i = 0; i < s.size(); )
+            {
+                uint32_t c = uint8_t(s[i]);
+                int n = c < 0x80 ? 0 : c < 0xE0 ? 1 : c < 0xF0 ? 2 : 3;
+                c &= n == 0 ? 0x7F : n == 1 ? 0x1F : n == 2 ? 0x0F : 0x07;
+                for (int k = 1; k <= n && i + k < s.size(); k++) c = c << 6 | (uint8_t(s[i + k]) & 0x3F);
+                i += n + 1;
+                w += c > 0xFFFF ? u'?' : char16_t(c);
+            }
+            return w;
+        };
+        auto strBytes = [&](const Achievements::Detail& d) { return (wide(d.name).size() + wide(d.description).size() + wide(d.locked).size() + 3) * 2; };
+        size_t n = 0, bytes = 0;
+        while (n < e->perCall && e->position + n < list.size() && bytes + 0x24 + strBytes(list[e->position + n]) <= cbBuffer)
+            bytes += 0x24 + strBytes(list[e->position + n++]);
+        uint8_t* buf = static_cast<uint8_t*>(pvBuffer);
+        const uint32_t guestBuf = g_memory.MapVirtual(pvBuffer);
+        size_t strOff = n * 0x24;
+        auto putStr = [&](const std::string& s) {
+            const uint32_t at = guestBuf + uint32_t(strOff);
+            for (char16_t c : wide(s)) { *reinterpret_cast<be<uint16_t>*>(buf + strOff) = uint16_t(c); strOff += 2; }
+            *reinterpret_cast<be<uint16_t>*>(buf + strOff) = 0; strOff += 2;
+            return at;
+        };
+        for (size_t i = 0; i < n; i++)
+        {
+            const auto& d = list[e->position + i];
+            be<uint32_t>* r = reinterpret_cast<be<uint32_t>*>(buf + i * 0x24);
+            r[0] = d.id;
+            r[1] = putStr(d.name);
+            r[2] = putStr(d.description);
+            r[3] = putStr(d.locked);
+            r[4] = d.imageId;
+            r[5] = d.gamerscore;
+            const uint64_t ft = d.unlocked ? (uint64_t(d.unlocked) + 11644473600ull) * 10000000ull : 0;
+            r[6] = uint32_t(ft >> 32);
+            r[7] = uint32_t(ft);
+            r[8] = d.flags | (d.unlocked ? 0x20000u : 0u);
+        }
+        e->position += n;
+        returned = n;
+        static int s_logs = 0;
+        if (s_logs++ < 4)
+            LOGFN("[achievements] the game read {} achievements ({} bytes)", n, strOff);
+        if (pcItemsReturned)
+            *pcItemsReturned = uint32_t(returned);
+        return CompleteOverlapped(pOverlapped, returned ? X_ERROR_SUCCESS : X_ERROR_NO_MORE_FILES, uint32_t(returned));
+    }
     while (returned < e->perCall && e->position < e->count && (returned + 1) * e->itemSize <= cbBuffer)
     {
         memcpy((uint8_t*)pvBuffer + returned * e->itemSize, e->items.data() + e->position * e->itemSize, e->itemSize);
@@ -354,18 +412,23 @@ uint32_t XamEnumerate(uint32_t hEnum, uint32_t dwFlags, void* pvBuffer, uint32_t
     return CompleteOverlapped(pOverlapped, result, uint32_t(returned));
 }
 
-// XamUserCreateAchievementEnumerator(titleId, userIndex, xuid (64-bit, r5), flags, offset, count, pcbBuffer, phEnum):
-// no achievements (empty enumerator). Unimplemented, the game waited ~5 s after Start on the title screen.
+// XamUserCreateAchievementEnumerator(titleId, userIndex, xuid (64-bit, r5), flags, offset, count, pcbBuffer, phEnum).
+// Unimplemented, the game waited ~5 s after Start on the title screen. Step 38f: the game's own list (from its XDBF
+// data, kernel/achievements.cpp) with the player's unlocks; with the empty list of before, the game unlocked none.
 PPC_FUNC(__imp__XamUserCreateAchievementEnumerator)
 {
     auto* e = CreateKernelObject<XamEnumerator>();
-    e->itemSize = 0x1C;
+    e->itemSize = 0x24;
+    e->achievements = true;
     const uint32_t count = ctx.r8.u32;
+    e->position = ctx.r7.u32;
+    e->perCall = std::max<uint32_t>(1, count);
+    e->count = Achievements::Details().size();
     if (auto pcb = reinterpret_cast<be<uint32_t>*>(g_memory.Translate(ctx.r9.u32)); ctx.r9.u32)
         *pcb = std::max<uint32_t>(1, count) * (0x1C + 0x200);
     if (auto ph = reinterpret_cast<be<uint32_t>*>(g_memory.Translate(ctx.r10.u32)); ctx.r10.u32)
         *ph = GetKernelHandle(e);
-    LOGFN("XamUserCreateAchievementEnumerator(count {}) -> empty enumerator", count);
+    LOGFN("XamUserCreateAchievementEnumerator(offset {}, count {}) -> {} achievements", e->position, count, e->count);
     ctx.r3.u64 = X_ERROR_SUCCESS;
 }
 uint32_t XamUserCreateStatsEnumerator(uint32_t titleId, uint32_t userIndex, uint32_t xuidCount, void* xuids,
@@ -637,9 +700,23 @@ uint32_t XMsgInProcessCall(uint32_t app, uint32_t message, be<uint32_t>* param1,
     return 0;
 }
 
+// Step 38f: XUserWriteAchievements = message 0xB0008 to the XGI app (0xFB): { count, pointer to { user, id }[count] }
+static void XMsgAchievements(uint32_t app, uint32_t message, void* buffer, uint32_t bufferSize)
+{
+    static std::set<uint64_t> s_seen;
+    static std::mutex s_m;
+    { std::lock_guard l(s_m); if (s_seen.insert(uint64_t(app) << 32 | message).second) LOGFN("[xmsg] app 0x{:X} message 0x{:X} ({} bytes) seen", app, message, bufferSize); }
+    if (app == 0xFB && message == 0xB0008 && buffer != nullptr && bufferSize >= 8)
+    {
+        auto* b = static_cast<be<uint32_t>*>(buffer);
+        Achievements::Write(b[0], b[1]);
+    }
+}
+
 uint32_t XMsgStartIORequest(uint32_t app, uint32_t message, XXOVERLAPPED* overlapped, void* buffer, uint32_t bufferSize)
 {
     LOG_ONCE("XMsgStartIORequest(app 0x{:X}, msg 0x{:X}) (first call; later ones not logged)", app, message);
+    XMsgAchievements(app, message, buffer, bufferSize);
     return CompleteOverlapped(overlapped, X_ERROR_SUCCESS);
 }
 
@@ -647,6 +724,7 @@ uint32_t XMsgStartIORequest(uint32_t app, uint32_t message, XXOVERLAPPED* overla
 uint32_t XMsgStartIORequestEx(uint32_t app, uint32_t message, XXOVERLAPPED* overlapped, void* buffer, uint32_t bufferSize, uint32_t flags)
 {
     LOG_ONCE("XMsgStartIORequestEx(app 0x{:X}, msg 0x{:X}) (first call; later ones not logged)", app, message);
+    XMsgAchievements(app, message, buffer, bufferSize);
     return CompleteOverlapped(overlapped, X_ERROR_SUCCESS);
 }
 

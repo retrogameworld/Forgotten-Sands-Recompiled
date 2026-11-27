@@ -1,4 +1,5 @@
 #include <stdafx.h>
+#include <kernel/achievements.h>
 #ifdef __x86_64__
 #include <cpuid.h>
 #endif
@@ -241,6 +242,7 @@ int main(int argc, char* argv[])
     }
 
     KernelStartTimeStampUpdater();
+    Achievements::Init(Config::UserPath); // Step 38f: the game's achievement list from the XEX, earlier unlocks
 #ifdef __ANDROID__
     // Step 37: the app's home-screen icon comes from the player's own game (see XexWriteTitleImage)
     {

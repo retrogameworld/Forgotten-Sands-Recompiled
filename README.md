@@ -1,6 +1,6 @@
 # Forgotten Sands Recompiled
 
-**Version 1.1** - see the [changelog](CHANGELOG.md).
+**Version 1.2** - see the [changelog](CHANGELOG.md).
 
 An unofficial native port of **Prince of Persia: The Forgotten Sands** (Xbox 360) for **Windows PC** and **Android**,
 made by static recompilation. The game's Xbox 360 program was translated into native x86-64 and ARM64 code, and the
@@ -24,6 +24,7 @@ Entertainment.
 - The boot logos can be skipped
 - Many fixes over the original at high frame rates (camera close-ups, shadow cascades, sun glare, effects)
 - Shaders are translated in the background and kept in a cache, so later starts load faster
+- The game's 40 achievements, with an on-screen notice when one unlocks (see [Achievements](#achievements))
 
 A controller is required (any XInput or PlayStation controller that SDL recognises). Keyboard and mouse are not
 supported.
@@ -88,9 +89,19 @@ apply at the next start. The most important ones:
 | `display_mode` | `"borderless"` (default), `"fullscreen"` or `"windowed"` (Alt+Enter switches) |
 | `antialiasing` | `"fxaa_extreme"` (default), `"fxaa"` or `"off"` |
 | `vibration` | controller rumble on / off |
+| `reset_achievements` | `true` = clear all achievements at the next start (saves are not touched); turns back to `false` by itself |
 
 Saves and the shader cache are kept in the `user` folder next to the exe, the log in `ForgottenSandsRecomp.log` next to it.
 Delete `settings.toml` to get the default settings back.
+
+## Achievements
+
+The game's own Xbox 360 achievements unlock as you play. A notice with the icon, name and gamerscore appears at the top
+of the screen for a few seconds. The unlocks are kept in `achievements\unlocked.txt` in your save folder; the full list
+(names, descriptions, gamerscore, icons) is written to `achievements\list.json` and `achievements\icons` at every
+start, read from your own copy of the game. To reset all achievements, set `reset_achievements = true` in `settings.toml` (it clears them at the next start
+and turns back to `false`), or delete `unlocked.txt`. Your game saves are
+separate and are not touched. Achievements unlocked on a console or before version 1.2 are not carried over.
 
 ## How it works
 
@@ -118,6 +129,9 @@ game files.
 ## Changelog
 
 The full history is in [CHANGELOG.md](CHANGELOG.md). Latest version:
+
+**1.2 (2026-11-27)** - achievements: the game's 40 achievements unlock with an on-screen notice (list and unlocks in
+the `achievements` folder next to your saves); the Uplay "Action completed" popup is gone.
 
 **1.1 (2026-11-27)** - fixes enemies not attacking and jars not breaking (a side effect of the 1.0 memory change).
 

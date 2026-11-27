@@ -13,6 +13,10 @@
 //    goes through XenosRecomp + DXC in-process, cached on disk by hash (user/shader_cache).
 //  * Rendering is recorded synchronously on the calling guest thread (one global lock) instead
 //    of Unleashed's render thread; simpler while bringing the game up.
+#include <kernel/achievements.h>
+#ifdef _WIN32
+#include "achievement_toast.h"
+#endif
 #include <deque>
 #include <stdafx.h>
 #include <os/process.h>
@@ -665,6 +669,7 @@ namespace WriteWatch
 static std::recursive_mutex g_mutex;
 
 static SDL_Window* g_window;
+
 static RenderWindow g_renderWindow;
 static std::unique_ptr<RenderInterface> g_interface;
 static std::unique_ptr<RenderDevice> g_device;
@@ -3415,6 +3420,69 @@ static void SetSurfaceFrameRate(ANativeWindow* window, int fps)
 }
 #endif
 
+#ifdef _WIN32
+// Step 38f (PC, the tester: achievements): a new unlock is shown for 6 seconds at the top of the screen, over the game's
+// picture: icon, "Achievement unlocked", gamerscore and name (achievement_toast.cpp draws it). It slides in from the
+// top edge and back out. The Android app shows its own notice (GameActivity).
+static void DrawAchievementToast(const RenderFramebuffer* framebuffer, uint32_t outW, uint32_t outH)
+{
+    struct Toast { std::unique_ptr<RenderTexture> tex; std::unique_ptr<RenderTextureView> view; uint32_t desc = 0, w = 0, h = 0; };
+    static Toast s_now, s_old;
+    static std::chrono::steady_clock::time_point s_start{};
+    static bool s_active = false;
+    constexpr double SHOW = 6.0, SLIDE_IN = 0.25, SLIDE_OUT = 0.35;
+    const auto now = std::chrono::steady_clock::now();
+    if (!s_active)
+    {
+        std::string notice;
+        if (!Achievements::PollNotice(notice))
+            return;
+        std::vector<uint8_t> rgba;
+        uint32_t w = 0, h = 0;
+        if (!BuildAchievementToast(notice, outH, rgba, w, h) || w > outW || h > outH)
+            return;
+        // the one before (6+ seconds old, no frame uses it any more) goes; the new one takes a new descriptor
+        if (s_old.tex)
+        {
+            g_layouts.erase(s_old.tex.get());
+            g_textureDescriptorAllocator.free(s_old.desc);
+        }
+        s_old = std::move(s_now);
+        s_now = {};
+        s_now.tex = g_device->createTexture(RenderTextureDesc::Texture2D(w, h, 1, RenderFormat::R8G8B8A8_UNORM));
+        RenderTextureViewDesc viewDesc;
+        viewDesc.format = RenderFormat::R8G8B8A8_UNORM;
+        viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
+        viewDesc.mipLevels = 1;
+        s_now.view = s_now.tex->createTextureView(viewDesc);
+        s_now.desc = g_textureDescriptorAllocator.allocate();
+        s_now.w = w;
+        s_now.h = h;
+        g_textureDescriptorSet->setTexture(s_now.desc, s_now.tex.get(), RenderTextureLayout::SHADER_READ, s_now.view.get());
+        UploadSubresource(s_now.tex.get(), RenderFormat::R8G8B8A8_UNORM, 0, 0, w, h, 1, 1, 4, rgba.data(), w * 4);
+        s_start = now;
+        s_active = true;
+    }
+    const double t = std::chrono::duration<double>(now - s_start).count();
+    if (t >= SHOW)
+    {
+        s_active = false;
+        return;
+    }
+    // how much of it is still above the top edge while it slides in / out
+    double in = std::min(1.0, t / SLIDE_IN), out = std::min(1.0, (SHOW - t) / SLIDE_OUT);
+    const double shown = std::min(1.0 - (1.0 - in) * (1.0 - in), 1.0 - (1.0 - out) * (1.0 - out));
+    const uint32_t margin = std::max(8u, outH / 40);
+    const int32_t top = int32_t(std::lround((double(s_now.h) + margin) * shown)) - int32_t(s_now.h); // final: margin
+    const uint32_t hidden = top < 0 ? uint32_t(-top) : 0;
+    if (hidden >= s_now.h)
+        return;
+    Transition(s_now.tex.get(), RenderTextureLayout::SHADER_READ);
+    BlitToFramebuffer(framebuffer, SWAPCHAIN_FORMAT, s_now.w, s_now.h - hidden, s_now.desc, 0.0f, float(hidden) / float(s_now.h), 1.0f, 1.0f, 0,
+        int32_t(outW - s_now.w) / 2, std::max(0, top));
+}
+#endif
+
 static void PresentDescriptor(const RenderTexture* source, uint32_t descriptorIndex, uint32_t width, uint32_t height)
 {
 #ifdef __ANDROID__
@@ -3627,6 +3695,9 @@ static void PresentDescriptor(const RenderTexture* source, uint32_t descriptorIn
             g_commandLists[g_frame]->clearColor(0, RenderColor(0, 0, 0, 1));
             g_currentFramebuffer = nullptr;
         }
+#ifdef _WIN32
+        DrawAchievementToast(framebuffer.get(), g_swapChain->getWidth(), g_swapChain->getHeight()); // Step 38f
+#endif
         Transition(swapTexture, RenderTextureLayout::PRESENT);
     }
 
@@ -3673,6 +3744,11 @@ static void WriteScreenshot(uint32_t descriptorIndex, const RenderTexture* sourc
     Transition(source, RenderTextureLayout::SHADER_READ);
     Transition(target.get(), RenderTextureLayout::COLOR_WRITE);
     BlitToFramebuffer(framebuffer.get(), RenderFormat::B8G8R8A8_UNORM, width, height, descriptorIndex, 0, 0, 1, 1, getenv("FS_HALFPIXEL") ? 0 : width);
+#ifdef _WIN32
+    static_assert(SWAPCHAIN_FORMAT == RenderFormat::B8G8R8A8_UNORM);
+    if (forcedPath == nullptr)
+        DrawAchievementToast(framebuffer.get(), width, height); // Step 38f: screenshots show what the player sees
+#endif
     Transition(target.get(), RenderTextureLayout::COPY_SOURCE);
     g_commandLists[g_frame]->copyTextureRegion(
         RenderTextureCopyLocation::PlacedFootprint(readback.get(), RenderFormat::B8G8R8A8_UNORM, width, height, 1, pitch / 4, 0),

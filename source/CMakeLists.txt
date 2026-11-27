@@ -170,6 +170,9 @@ set(FS_RUNTIME_SOURCES
     "${RT}/kernel/imports.cpp"
     "${RT}/kernel/frame_time_hooks.cpp"
     "${RT}/kernel/camera_hooks.cpp"
+    "${RT}/kernel/uplay_hooks.cpp"
+    "${RT}/gpu/achievement_toast.cpp" # Step 38f (PC only; empty elsewhere)
+    "${RT}/kernel/achievements.cpp"
     "${RT}/kernel/import_log.cpp"
     "${RT}/kernel/import_fallback.cpp"
     "${RT}/kernel/guest_printf.cpp"
@@ -279,6 +282,8 @@ if (ANDROID)
     endif()
 endif()
 
+# Step 38f: stb_image (PNG icons of the PC achievement notice)
+set_source_files_properties("${RT}/gpu/achievement_toast.cpp" PROPERTIES INCLUDE_DIRECTORIES "${UR_THIRDPARTY}/stb")
 target_link_libraries(ForgottenSandsRecomp PRIVATE
     ForgottenSandsPPC
     SDL2::SDL2-static

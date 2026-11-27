@@ -401,6 +401,37 @@ uint32_t XexGetProcedureAddress(uint32_t module, uint32_t ordinal, be<uint32_t>*
     return 0xC0000225; // STATUS_NOT_FOUND
 }
 
+// Step 38f: the title's XDBF (SPA) data from the XEX resources (achievements, strings, images) - the player's own disc.
+bool XexGetXdbf(const uint8_t** data, uint32_t* size)
+{
+    if (g_xex.headerGuest == 0)
+        return false;
+    const uint8_t* header = static_cast<const uint8_t*>(g_memory.Translate(g_xex.headerGuest));
+    auto* info = reinterpret_cast<const be<uint32_t>*>(getOptHeaderPtr(header, XEX_HEADER_RESOURCE_INFO));
+    if (info == nullptr)
+        return false;
+    const uint32_t count = (uint32_t(info[0]) - 4) / 16;
+    char want[9];
+    snprintf(want, sizeof(want), "%08X", g_xex.titleId);
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const uint8_t* entry = reinterpret_cast<const uint8_t*>(info) + 4 + i * 16;
+        std::string upper(reinterpret_cast<const char*>(entry), strnlen(reinterpret_cast<const char*>(entry), 8));
+        for (auto& ch : upper) ch = char(toupper(uint8_t(ch)));
+        const uint32_t address = uint32_t(*reinterpret_cast<const be<uint32_t>*>(entry + 8));
+        const uint32_t sz = uint32_t(*reinterpret_cast<const be<uint32_t>*>(entry + 12));
+        if (upper != want || sz < 24)
+            continue;
+        const uint8_t* x = static_cast<const uint8_t*>(g_memory.Translate(address));
+        if (memcmp(x, "XDBF", 4) != 0)
+            return false;
+        *data = x;
+        *size = sz;
+        return true;
+    }
+    return false;
+}
+
 bool XexWriteTitleImage(const std::filesystem::path& out)
 {
     if (g_xex.headerGuest == 0)
