@@ -2,6 +2,12 @@
 
 All releases of Forgotten Sands Recompiled (Windows PC). The newest version is at the top.
 
+## 1.1 (2026-11-27)
+
+- Fixed: enemies did not attack and jars could not be broken in 1.0 (found through the Android version: the memory
+  change in 1.0 placed the game's memory blocks directly one after another, which the game does not expect). The
+  memory fix (no more running out of memory) stays.
+
 ## 1.0 (2026-11-27)
 
 First numbered release. Releases before it were named by date (the last one: v2026.11.24). Changes since v2026.11.24:

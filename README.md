@@ -1,6 +1,6 @@
 # Forgotten Sands Recompiled
 
-**Version 1.0** - see the [changelog](CHANGELOG.md).
+**Version 1.1** - see the [changelog](CHANGELOG.md).
 
 An unofficial native port of **Prince of Persia: The Forgotten Sands** (Xbox 360) for **Windows PC** and **Android**,
 made by static recompilation. The game's Xbox 360 program was translated into native x86-64 and ARM64 code, and the
@@ -118,6 +118,8 @@ game files.
 ## Changelog
 
 The full history is in [CHANGELOG.md](CHANGELOG.md). Latest version:
+
+**1.1 (2026-11-27)** - fixes enemies not attacking and jars not breaking (a side effect of the 1.0 memory change).
 
 **1.0 (2026-11-27)** - first numbered release (earlier releases were named by date): fixes missing walls and floors in
 some rooms, the game running out of memory as you play on, a rare sound-engine crash or freeze, a flickering wall and a

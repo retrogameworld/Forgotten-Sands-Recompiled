@@ -355,8 +355,14 @@ static void LoadPipelineCache(); // Step 37 (Android): Vulkan pipeline cache kep
 // Step 37 (the tester: "add an fps option in settings so i can see"): frames per second over the last half second, read by
 // the Android app's on-screen counter (GameActivity, settings.toml show_fps) through nativeShownFps().
 static std::atomic<float> g_shownFps{0.0f};
+#ifdef __ANDROID__
+void FsGpuDriverFramePresented(); // Step 38d (os/android_gpu_driver.cpp)
+#endif
 static void UpdateShownFps()
 {
+#ifdef __ANDROID__
+    FsGpuDriverFramePresented();
+#endif
     static auto s_start = std::chrono::steady_clock::now();
     static uint32_t s_frames = 0;
     s_frames++;
@@ -3734,6 +3740,11 @@ void Video::ToggleFullscreen()
 // is told to the player on screen and in ForgottenSandsRecomp.log instead of leaving a black screen.
 static std::string g_startupError;
 const std::string& Video::StartupError() { return g_startupError; }
+#ifdef __ANDROID__
+const std::string& FsCustomDriverProblem(); // Step 38d (os/android_gpu_driver.cpp)
+const std::string& FsDriverStatus();
+void FsCustomDriverNotUsed(const std::string& why);
+#endif
 static void GpuFatalError(const char* message)
 {
     static std::atomic<bool> s_once{false};
@@ -3845,6 +3856,12 @@ bool Video::CreateHostDevice(const char* sdlVideoDriver)
     if (!g_device)
     {
         g_startupError = plume::GetLastDeviceError().empty() ? std::string("No usable Vulkan GPU was found.") : plume::GetLastDeviceError();
+#ifdef __ANDROID__
+        if (FsDriverStatus() != "system")
+            g_startupError += "\n\n(This was with your custom GPU driver " + FsDriverStatus() + ". Settings > GPU driver > System uses the device's own driver again.)";
+        else if (getenv("FS_GPU_DRIVER_DIR") == nullptr && g_startupError.find("shaderInt64") != std::string::npos)
+            g_startupError += "\n\nOn Adreno 6xx devices a custom Turnip driver can help: Settings > GPU driver (see the README).";
+#endif
         LOGFN_ERROR("No usable Vulkan device: {}", g_startupError);
         return false;
     }
@@ -3855,6 +3872,22 @@ bool Video::CreateHostDevice(const char* sdlVideoDriver)
     g_capabilities = g_device->getCapabilities();
     const auto& desc = g_device->getDescription();
     LOGFN("Vulkan device: {} (driver 0x{:X}, {} MB)", desc.name, desc.driverVersion, desc.dedicatedVideoMemory / (1024 * 1024));
+#ifdef __ANDROID__
+    // Qualcomm's own drivers number their versions with the top bit set (0x80......); Mesa (Turnip) does not, and its
+    // device name starts with "Turnip"
+    if (FsDriverStatus() != "system" && desc.name.find("Turnip") == std::string::npos && desc.name.find("Adreno") == std::string::npos)
+        FsCustomDriverNotUsed("custom drivers only work on Adreno GPUs - this device's " + desc.name + " uses its own driver");
+    else if (FsDriverStatus() != "system" && (desc.driverVersion & 0x80000000u) != 0 && desc.name.find("Turnip") == std::string::npos)
+        FsCustomDriverNotUsed("it did not load - the device's own driver answered instead");
+    LOGFN("[gpu] driver: {}", FsDriverStatus() == "system" ? std::string("system") : "custom (" + FsDriverStatus() + ")");
+    if (!FsCustomDriverProblem().empty())
+    {
+        const std::string text = "Your custom GPU driver is not used: " + FsCustomDriverProblem() + ".\n\nThe device's own driver is used instead. You can choose the driver again under Settings > GPU driver.";
+        LOGFN_WARNING("[gpu] {}", text);
+        if (Config::Window)
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Forgotten Sands", text.c_str(), nullptr);
+    }
+#endif
 
     g_queue = g_device->createCommandQueue(RenderCommandListType::DIRECT);
     for (size_t i = 0; i < NUM_FRAMES; i++)

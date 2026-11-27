@@ -3900,10 +3900,10 @@ index eeb193b..22cf05d 100644
 +    };
 +};
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 9103ca8..50974ce 100644
+index 9103ca8..7598223 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
-@@ -1,4575 +1,4886 @@
+@@ -1,4575 +1,4908 @@
 -//
 -// plume
 -//
@@ -8572,6 +8572,12 @@ index 9103ca8..50974ce 100644
 +        VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
 +    };
 +
++#   if defined(__ANDROID__)
++}
++#include <dlfcn.h>
++void *FsOpenCustomVulkanLibrary(); // Step 38d (src/runtime/os/android_gpu_driver.cpp)
++namespace plume {
++#   endif
 +    // Forgotten Sands Step 38: device error text and fatal GPU error callback (see plume_vulkan.h).
 +    static std::string g_lastDeviceError;
 +    static void (*g_fatalErrorCallback)(const char *) = nullptr;
@@ -13190,7 +13196,23 @@ index 9103ca8..50974ce 100644
 +#else
 +    VulkanInterface::VulkanInterface() {
 +#endif
-+        VkResult res = volkInitialize();
++        VkResult res = VK_ERROR_INITIALIZATION_FAILED;
++#   if defined(__ANDROID__)
++        // Forgotten Sands Step 38d: a custom Vulkan driver chosen in Settings (Turnip for Adreno 6xx), see
++        // src/runtime/os/android_gpu_driver.cpp; the system driver when none is chosen or it cannot be loaded.
++        if (void *custom = FsOpenCustomVulkanLibrary()) {
++            auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(custom, "vkGetInstanceProcAddr"));
++            if (gipa != nullptr) {
++                volkInitializeCustom(gipa);
++                res = VK_SUCCESS;
++            }
++            else {
++                fprintf(stderr, "custom Vulkan loader has no vkGetInstanceProcAddr\n");
++            }
++        }
++        if (res != VK_SUCCESS)
++#   endif
++        res = volkInitialize();
 +        if (res != VK_SUCCESS) {
 +            fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
 +            return;

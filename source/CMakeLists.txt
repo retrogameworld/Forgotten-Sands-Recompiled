@@ -203,6 +203,9 @@ if (WIN32)
     list(APPEND FS_RUNTIME_SOURCES "${RT}/os/win32/process_win32.cpp")
 else()
     list(APPEND FS_RUNTIME_SOURCES "${RT}/os/linux/process_linux.cpp")
+    if (ANDROID)
+        list(APPEND FS_RUNTIME_SOURCES "${RT}/os/android_gpu_driver.cpp") # Step 38d: custom GPU driver (Turnip)
+    endif()
 endif()
 
 if (ANDROID)
@@ -260,6 +263,20 @@ endif()
 if (ANDROID)
     target_link_libraries(ForgottenSandsRecomp PRIVATE android log)
     target_link_options(ForgottenSandsRecomp PRIVATE -Wl,-Bsymbolic) # FFmpeg's ARM64 assembly refers to its tables directly
+    # Step 38d: custom GPU drivers (Turnip) through libadrenotools (BSD-2), when its source is in tools\libadrenotools
+    # (https://github.com/bylaws/libadrenotools with its submodules). Without it the "GPU driver" setting reports that
+    # custom drivers are not supported and the system driver is used. The hook libraries it builds (lib*_hook.so)
+    # go into the APK next to libmain.so (android/build_apk.sh).
+    set(FS_ADRENOTOOLS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/libadrenotools")
+    if (EXISTS "${FS_ADRENOTOOLS}/CMakeLists.txt")
+        add_subdirectory("${FS_ADRENOTOOLS}" "${CMAKE_BINARY_DIR}/adrenotools")
+        target_link_libraries(ForgottenSandsRecomp PRIVATE adrenotools)
+        target_compile_definitions(ForgottenSandsRecomp PRIVATE FS_HAVE_ADRENOTOOLS=1)
+        add_dependencies(ForgottenSandsRecomp main_hook file_redirect_hook gsl_alloc_hook hook_impl) # its hook libraries go into the APK
+        message(STATUS "libadrenotools: custom GPU drivers enabled")
+    else()
+        message(STATUS "libadrenotools not found (tools/libadrenotools): custom GPU drivers disabled")
+    endif()
 endif()
 
 target_link_libraries(ForgottenSandsRecomp PRIVATE

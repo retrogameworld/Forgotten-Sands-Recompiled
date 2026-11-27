@@ -266,7 +266,23 @@ uint32_t NtQueryVirtualMemory(uint32_t address, X_MEMORY_BASIC_INFORMATION* info
 
 uint32_t MmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t size, uint32_t protect, uint32_t minAddress, uint32_t maxAddress, uint32_t alignment)
 {
-    void* ptr = g_userHeap.AllocPhysical(size, alignment);
+    // test FS_PHYS_PAGE=1: sizes and alignment in whole pages (4 KB, 64 KB with X_MEM_LARGE_PAGES), like the console
+    if (getenv("FS_PHYS_PAGE"))
+    {
+        const uint32_t page = (protect & X_MEM_LARGE_PAGES) ? 0x10000u : 0x1000u;
+        size = (size + page - 1) & ~(page - 1);
+        alignment = std::max(alignment, page);
+    }
+    static const bool s_logAllocs = getenv("FS_LOG_PHYS_ALLOCS") != nullptr; // test
+    if (s_logAllocs) LOGFN("[mem] MmAllocatePhysicalMemoryEx flags 0x{:X} size 0x{:X} protect 0x{:X} min 0x{:X} max 0x{:X} align 0x{:X}", flags, size, protect, minAddress, maxAddress, alignment);
+    // Step 38e (GitHub #2 follow-up, 1.1: "the enemies do not attack, and the jars cannot be broken"; reproduced on the
+    // PC in the first fight: the Prince took no damage): with the Step 38 allocator the game's blocks (8 MB / 2 MB / 64 KB
+    // large-page blocks) came back directly one after another. With unused room after each block (the old o1heap left
+    // plenty) the enemies attack again; no write past a block was ever seen (FS_PHYS_GUARD), so the game depends on its
+    // blocks not being contiguous. 4 KB of room after every block of the game (about 0.3 MB in all).
+    // FS_PHYS_GAP=<bytes> changes it (0 = none).
+    static const uint32_t s_gap = [] { const char* e = getenv("FS_PHYS_GAP"); return e ? uint32_t(strtoul(e, nullptr, 0)) : 0x1000u; }();
+    void* ptr = g_userHeap.AllocPhysical(size + s_gap, alignment);
     if (ptr == nullptr)
     {
         LOGFN_ERROR("MmAllocatePhysicalMemoryEx: out of physical memory (size 0x{:X})", size);

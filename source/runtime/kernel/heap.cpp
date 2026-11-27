@@ -23,6 +23,23 @@ static void TrackHeapEvent(const char* what, void* ptr, size_t size)
 }
 // ---- PhysicalArena (Step 38) ----
 static constexpr uint32_t PHYS_GRANULE = 16;
+// Debug FS_PHYS_GUARD=1: 64 bytes after every block are filled with 0xA5 and checked on free and every 10 s - a block
+// written past its requested size is logged (the old o1heap had slack after most blocks; this arena has none).
+static uint32_t PhysGuard() { static const uint32_t s_g = [] { const char* e = getenv("FS_PHYS_GUARD"); return e ? std::max(64u, uint32_t(atoi(e)) & ~15u) : 0u; }(); return s_g; }
+static void CheckGuard(uint32_t address, uint32_t requested, const char* when)
+{
+    const uint32_t g = PhysGuard();
+    if (g == 0) return;
+    const uint8_t* p = static_cast<const uint8_t*>(g_memory.Translate(address + requested));
+    for (uint32_t i = 0; i < g; i++)
+        if (p[i] != 0xA5)
+        {
+            static std::atomic<int> s_n{0};
+            if (s_n++ < 60)
+                LOGFN_WARNING("[mem] OVERRUN ({}): physical block 0x{:08X} size 0x{:X} written at +0x{:X} (byte 0x{:02X})", when, address, requested, requested + i, p[i]);
+            return;
+        }
+}
 
 void PhysicalArena::Init(uint32_t b, uint32_t e)
 {
@@ -65,7 +82,7 @@ void PhysicalArena::InsertFree(uint32_t start, uint32_t size)
 
 uint32_t PhysicalArena::Allocate(uint32_t size, uint32_t alignment)
 {
-    const uint32_t need = (std::max<uint32_t>(size, 1) + PHYS_GRANULE - 1) & ~(PHYS_GRANULE - 1);
+    const uint32_t need = (std::max<uint32_t>(size, 1) + PhysGuard() + PHYS_GRANULE - 1) & ~(PHYS_GRANULE - 1);
     alignment = std::max<uint32_t>(alignment, PHYS_GRANULE);
     // Best fit: the smallest free block that holds the request at the asked alignment (lowest address on ties).
     for (auto it = freeBySize.lower_bound({ need, 0 }); it != freeBySize.end(); ++it)
@@ -78,6 +95,7 @@ uint32_t PhysicalArena::Allocate(uint32_t size, uint32_t alignment)
         InsertFree(start, uint32_t(a - start));                                    // the part before the alignment
         InsertFree(uint32_t(a + need), uint32_t(uint64_t(start) + bsize - (a + need))); // the rest
         live[uint32_t(a)] = { uint32_t(a), need, size };
+        if (PhysGuard()) memset(g_memory.Translate(uint32_t(a) + size), 0xA5, PhysGuard());
         used += need;
         requested += size;
         peakUsed = std::max(peakUsed, used);
@@ -97,6 +115,7 @@ bool PhysicalArena::Free(uint32_t address)
     if (it == live.end())
         return false;
     const Block b = it->second;
+    CheckGuard(b.start, b.requested, "free");
     live.erase(it);
     used -= b.size;
     requested -= b.requested;
@@ -137,6 +156,9 @@ void Heap::LogPhysicalStats(const char* why)
         return;
     }
     const auto& a = physicalArena;
+    if (PhysGuard())
+        for (const auto& [addr, blk] : a.live)
+            CheckGuard(addr, blk.requested, why);
     LOGFN("[mem] physical heap ({}): in use {:.1f} MB ({} blocks), peak {:.1f} MB, of {:.1f} MB, largest free {:.1f} MB in {} free ranges, failed {}",
         why, a.used / 1048576.0, a.live.size(), a.peakUsed / 1048576.0, (a.end - a.begin) / 1048576.0, a.LargestFree() / 1048576.0, a.freeByAddr.size(), a.oomCount);
 }
